@@ -17,3 +17,7 @@ out
 .sync/
 .logs/
 node_modules/
+
+# Python build runner
+__pycache__/
+*.pyc

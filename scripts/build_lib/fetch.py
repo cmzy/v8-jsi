@@ -1,0 +1,225 @@
+"""Pull V8 source, pin to the version recorded in ``config.json``, apply
+the in-tree patches, run ``gclient sync``, and prune unneeded subtrees.
+
+Mirrors ``scripts/fetch_code.ps1``.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+from . import env
+
+
+# Paths under ``build/v8`` we delete after sync, copied verbatim from
+# ``fetch_code.ps1``. These shave off hundreds of MB and don't affect what
+# the v8jsi target compiles.
+_PRUNE_PATHS = (
+    "depot_tools/external_bin/gsutil",
+    "v8/test/test262/data/tools",
+    "v8/third_party/depot_tools/external_bin/gsutil",
+    "v8/third_party/perfetto",
+    "v8/third_party/protobuf",
+    "v8/third_party/rust",
+    "v8/third_party/rust-toolchain",
+    "v8/bazel",
+    "v8/tools/clusterfuzz",
+    "v8/tools/package-lock.json",
+    "v8/tools/package.json",
+    "v8/tools/turbolizer",
+)
+
+
+def _read_config(sources_path: Path) -> dict:
+    with (sources_path / "config.json").open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def _apply_patch(repo: Path, patch: Path) -> None:
+    print(f"Applying patch {patch.name} in {repo}...", flush=True)
+    # --ignore-whitespace matches the PS invocation; we also pass --3way so
+    # small drift is reported (with markers) instead of silently failing.
+    env.run(
+        ["git", "apply", "--ignore-whitespace", "--3way", str(patch)],
+        cwd=repo,
+    )
+
+
+def _capture_v8_version(v8_dir: Path) -> tuple[str, str]:
+    """Return ``(git_revision, v8_version)`` based on the current checkout."""
+    rev = subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=str(v8_dir),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    header = v8_dir / "include" / "v8-version.h"
+    text = header.read_text(encoding="utf-8")
+    m_major = re.search(r"V8_MAJOR_VERSION\s+(\d+)", text)
+    m_minor = re.search(r"V8_MINOR_VERSION\s+(\d+)", text)
+    m_build = re.search(r"V8_BUILD_NUMBER\s+(\d+)", text)
+    m_patch = re.search(r"V8_PATCH_LEVEL\s+(\d+)", text)
+    if not (m_major and m_minor and m_build and m_patch):
+        raise SystemExit(f"failed to parse v8-version.h at {header}")
+    v8_version = (
+        f"{m_major.group(1)}.{m_minor.group(1)}."
+        f"{m_build.group(1)}.{m_patch.group(1)}"
+    )
+    return rev, v8_version
+
+
+def _write_version_files(
+    sources_path: Path, v8_version: str, git_revision: str
+) -> str:
+    """Expand the version.rc / source_link.json templates. Returns the full
+    ``verString`` we emit to ADO (kept compatible with PS output)."""
+    config = _read_config(sources_path)
+    version = config["version"]  # e.g. "0.79.5"
+    parts = version.split(".")
+    if len(parts) < 3:
+        raise SystemExit(f"unexpected config.json version: {version!r}")
+    major, minor, build = parts[0], parts[1], parts[2]
+    v8_underscored = v8_version.replace(".", "_")
+
+    src_dir = sources_path / "src"
+    rc_template = (src_dir / "version.rc").read_text(encoding="utf-8")
+    rc_filled = (
+        rc_template
+        .replace("V8JSIVER_MAJOR", major)
+        .replace("V8JSIVER_MINOR", minor)
+        .replace("V8JSIVER_BUILD", build)
+        .replace("V8JSIVER_V8REF", v8_underscored)
+    )
+    (src_dir / "version_gen.rc").write_text(rc_filled, encoding="utf-8")
+
+    sl_template = (src_dir / "source_link.json").read_text(encoding="utf-8")
+    sl_filled = (
+        sl_template
+        .replace("LOCAL_PATH", str(sources_path).replace("\\", "\\\\"))
+        .replace("V8JSI_GIT_HASH", _our_git_hash(sources_path))
+        .replace("V8JSIVER_V8REF", v8_version)
+    )
+    (src_dir / "source_link_gen.json").write_text(sl_filled, encoding="utf-8")
+
+    return f"{version}-v8_{v8_underscored}"
+
+
+def _our_git_hash(sources_path: Path) -> str:
+    """Repo hash, used to stamp source_link.json. Returns ``"unknown"`` when
+    the sources tree isn't a git checkout (development rsync, CI tarball,
+    ...) so the script can still complete in those cases."""
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "--verify", "HEAD"],
+            cwd=str(sources_path),
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return "unknown"
+
+
+def _prune(work: Path) -> None:
+    for rel in _PRUNE_PATHS:
+        target = work / rel
+        if not target.exists():
+            continue
+        print(f"Pruning {target}", flush=True)
+        if target.is_dir():
+            shutil.rmtree(target)
+        else:
+            target.unlink()
+
+
+def fetch(
+    sources_path: Path,
+    *,
+    app_platform: str,
+    emit_ado: bool = False,
+    skip_patches: bool = False,
+) -> None:
+    work = env.build_work_dir(sources_path)
+    work.mkdir(parents=True, exist_ok=True)
+    v8 = env.v8_dir(sources_path)
+
+    # Step 1: fetch v8 if not already present, otherwise we'll just re-checkout.
+    if not v8.exists():
+        os.environ["GIT_REDIRECT_STDERR"] = "2>&1"
+        env.run(["fetch", "--no-history", "--nohooks", "v8"], cwd=work)
+    else:
+        print(f"v8 tree already present at {v8}, skipping fetch", flush=True)
+
+    # Step 2: when targeting Android/Linux/macOS the .gclient file needs an
+    # extra ``target_os`` entry so gclient pulls platform-specific deps.
+    if app_platform in ("android", "linux", "mac"):
+        gclient_path = work / ".gclient"
+        marker = f"target_os= ['{app_platform}']"
+        if gclient_path.exists():
+            content = gclient_path.read_text(encoding="utf-8")
+            if marker not in content:
+                with gclient_path.open("a", encoding="utf-8") as fh:
+                    fh.write(f"\n{marker}\n")
+
+    # Step 3: pin to the v8ref recorded in config.json.
+    config = _read_config(sources_path)
+    v8ref = config["v8ref"]
+    env.run(["git", "fetch", "origin", v8ref], cwd=v8)
+    env.run(["git", "checkout", "FETCH_HEAD"], cwd=v8)
+
+    # Step 4: apply the in-tree patches (skip when bringing up a new V8
+    # version; patches can be re-applied or refreshed afterwards).
+    patch_dir = sources_path / "scripts" / "patch"
+    if not skip_patches:
+        _apply_patch(v8, patch_dir / "src.diff")
+
+    # gclient runhooks + sync pull a complete checkout.
+    env.run(["gclient", "runhooks"], cwd=v8)
+    env.run(["gclient", "sync"], cwd=v8)
+
+    if not skip_patches:
+        _apply_patch(v8 / "build", patch_dir / "build.diff")
+        _apply_patch(v8 / "third_party" / "zlib", patch_dir / "zlib.diff")
+
+    # Step 5: stamp version.rc / source_link.json.
+    revision, v8_version = _capture_v8_version(v8)
+    ver_string = _write_version_files(sources_path, v8_version, revision)
+
+    if emit_ado:
+        print(f"##vso[task.setvariable variable=V8JSI_VERSION;]{ver_string}")
+        build_number = os.environ.get("BUILD_BUILDNUMBER")
+        if build_number:
+            v8_underscored = v8_version.replace(".", "_")
+            if not build_number.endswith(v8_underscored):
+                semver_parts = config["version"].split(".")
+                semver = f"{semver_parts[0]}.{semver_parts[1]}.{semver_parts[2]}"
+                new_build_number = (
+                    f"{build_number} - {semver}.{v8_underscored}"
+                )
+                print(
+                    f"##vso[build.updateBuildNumber]{new_build_number}"
+                )
+
+    # Step 6: install distro deps for the Linux/Android cross-compiles. We
+    # only call sudo when running on Linux; on Mac/Windows the script is a
+    # no-op even if the caller asked for an Android build (depot_tools
+    # already vendors the Android NDK in that case).
+    if env.is_linux() and app_platform == "android":
+        env.run(
+            ["sudo", "bash", str(v8 / "build" / "install-build-deps-android.sh")],
+            cwd=v8,
+        )
+    if env.is_linux() and app_platform == "linux":
+        env.run(
+            ["sudo", "bash", str(v8 / "build" / "install-build-deps.sh")],
+            cwd=v8,
+        )
+
+    _prune(work)
