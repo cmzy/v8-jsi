@@ -1,52 +1,24 @@
 diff --git a/BUILD.gn b/BUILD.gn
-index f0976f97e5..c4f6a026cf 100644
+index 382c7d3ed44..7ef6a37baaf 100644
 --- a/BUILD.gn
 +++ b/BUILD.gn
-@@ -1511,7 +1511,7 @@ config("toolchain") {
-   if (is_win) {
-     cflags += [
-       "/wd4245",  # Conversion with signed/unsigned mismatch.
--      "/wd4267",  # Conversion with possible loss of data.
-+      #"/wd4267",  # Conversion with possible loss of data.
-       "/wd4324",  # Padding structure due to alignment.
-       "/wd4701",  # Potentially uninitialized local variable.
-       "/wd4702",  # Unreachable code.
-@@ -1615,14 +1615,14 @@ config("toolchain") {
- 
-       "/wd4100",  # Unreferenced formal function parameter.
-       "/wd4121",  # Alignment of a member was sensitive to packing.
--      "/wd4244",  # Conversion: possible loss of data.
-+      #"/wd4244",  # Conversion: possible loss of data.
-       "/wd4505",  # Unreferenced local function has been removed.
-       "/wd4510",  # Default constructor could not be generated.
-       "/wd4512",  # Assignment operator could not be generated.
-       "/wd4610",  # Class can never be instantiated, constructor required.
-       "/wd4838",  # Narrowing conversion. Doesn't seem to be very useful.
--      "/wd4995",  # 'X': name was marked as #pragma deprecated
--      "/wd4996",  # Deprecated function warning.
-+      #"/wd4995",  # 'X': name was marked as #pragma deprecated
-+      #"/wd4996",  # Deprecated function warning.
- 
-       # These are variable shadowing warnings that are new in VS2015. We
-       # should work through these at some point -- they may be removed from
-@@ -1646,7 +1646,7 @@ config("toolchain") {
-       "/wd4245",  # 'conversion' : conversion from 'type1' to 'type2',
-                   # signed/unsigned mismatch
- 
--      "/wd4267",  # 'var' : conversion from 'size_t' to 'type', possible loss of
-+      #"/wd4267",  # 'var' : conversion from 'size_t' to 'type', possible loss of
-                   # data
- 
-       "/wd4305",  # 'identifier' : truncation from 'type1' to 'type2'
-@@ -7147,26 +7147,6 @@ group("v8_python_base") {
+@@ -8117,34 +8117,6 @@ group("v8_python_base") {
    data = [ ".vpython3" ]
  }
  
+-# Enable fallbacks for files that might be hard to access on Clusterfuzz.
+-copy("v8_clusterfuzz_fallbacks") {
+-  testonly = true
+-  sources = [ "test/mjsunit/wasm/wasm-module-builder.js" ]
+-  outputs = [ "$root_out_dir/test/mjsunit/wasm/wasm-module-builder.js" ]
+-}
+-
 -group("v8_clusterfuzz") {
 -  testonly = true
 -
 -  deps = [
 -    ":d8",
+-    ":v8_clusterfuzz_fallbacks",
 -    ":v8_simple_inspector_fuzzer",
 -    "tools/clusterfuzz/trials:v8_clusterfuzz_resources",
 -  ]
@@ -57,7 +29,7 @@ index f0976f97e5..c4f6a026cf 100644
 -      ":d8(//build/toolchain/linux:clang_x64_v8_arm64)",
 -      ":d8(//build/toolchain/linux:clang_x86)",
 -      ":d8(//build/toolchain/linux:clang_x86_v8_arm)",
--      ":d8(tools/clusterfuzz/foozzie/toolchain:clang_x64_pointer_compression)",
+-      ":d8(tools/clusterfuzz/foozzie/toolchain:clang_x64_fuzzer_experiments)",
 -    ]
 -  }
 -}
@@ -65,7 +37,7 @@ index f0976f97e5..c4f6a026cf 100644
  # Targets we ensure work with gcc. The aim is to keep this list small to have
  # a fast overall compile time.
  group("v8_gcc_light") {
-@@ -7401,7 +7381,7 @@ v8_executable("d8") {
+@@ -8407,7 +8379,7 @@ v8_executable("d8") {
    }
  
    if (v8_correctness_fuzzer) {
@@ -74,10 +46,10 @@ index f0976f97e5..c4f6a026cf 100644
    }
  
    defines = []
-@@ -8096,3 +8076,9 @@ if (!build_with_chromium && v8_use_perfetto) {
-     ]
-   }
- }  # if (!build_with_chromium && v8_use_perfetto)
+@@ -8847,3 +8819,9 @@ if (current_toolchain == default_toolchain) {
+ 
+   write_file("$root_build_dir/gn_logs.txt", _lines)
+ }
 +
 +group("jsi") {
 +  deps = [
@@ -85,11 +57,11 @@ index f0976f97e5..c4f6a026cf 100644
 +  ]
 +}
 diff --git a/DEPS b/DEPS
-index 529f54b59f..f0ecac5c0c 100644
+index b2c1f763079..dd13feb6172 100644
 --- a/DEPS
 +++ b/DEPS
-@@ -708,4 +708,15 @@ hooks = [
-                '--quiet',
+@@ -853,6 +853,17 @@ hooks = [
+                Var('rbe_instance'),
                 ],
    },
 +  {
@@ -104,11 +76,13 @@ index 529f54b59f..f0ecac5c0c 100644
 +    ],
 +  },
  ]
+ 
+ recursedeps = [
 diff --git a/src/heap/cppgc/marking-state.h b/src/heap/cppgc/marking-state.h
-index 4ce1ce4074..3153407f4f 100644
+index 73bd45147bc..3694933f555 100644
 --- a/src/heap/cppgc/marking-state.h
 +++ b/src/heap/cppgc/marking-state.h
-@@ -342,7 +342,7 @@ class MutatorMarkingState final : public BasicMarkingState {
+@@ -364,7 +364,7 @@ class MutatorMarkingState final : public BasicMarkingState {
    ~MutatorMarkingState() override = default;
  
    inline bool MarkNoPush(HeapObjectHeader& header) {
@@ -118,13 +92,13 @@ index 4ce1ce4074..3153407f4f 100644
  
    inline void ReTraceMarkedWeakContainer(cppgc::Visitor&, HeapObjectHeader&);
 diff --git a/src/maglev/maglev-ir.h b/src/maglev/maglev-ir.h
-index 68a751b775..75277e0f7e 100644
+index a94c1b89ab7..a05906621e3 100644
 --- a/src/maglev/maglev-ir.h
 +++ b/src/maglev/maglev-ir.h
-@@ -2335,8 +2335,8 @@ class NodeTMixin : public Base {
+@@ -2867,8 +2867,8 @@ class NodeTMixin : public BaseNode {
    template <typename... Args>
    explicit NodeTMixin(uint64_t bitfield, Args&&... args)
-       : Base(bitfield, std::forward<Args>(args)...) {
+       : BaseNode(bitfield, std::forward<Args>(args)...) {
 -    DCHECK_EQ(this->NodeBase::opcode(), NodeBase::opcode_of<Derived>);
 -    DCHECK_EQ(this->NodeBase::properties(), Derived::kProperties);
 +    //DCHECK_EQ(this->NodeBase::opcode(), NodeBase::opcode_of<Derived>);
@@ -132,20 +106,20 @@ index 68a751b775..75277e0f7e 100644
    }
  };
  
-@@ -2403,7 +2403,7 @@ class FixedInputNodeTMixin : public NodeTMixin<Base, Derived> {
+@@ -2941,7 +2941,7 @@ class FixedInputNodeTMixin : public NodeTMixin<BaseT, Derived> {
    template <typename... Args>
    explicit FixedInputNodeTMixin(uint64_t bitfield, Args&&... args)
-       : NodeTMixin<Base, Derived>(bitfield, std::forward<Args>(args)...) {
+       : NodeTMixin<BaseT, Derived>(bitfield, std::forward<Args>(args)...) {
 -    DCHECK_EQ(this->NodeBase::input_count(), kInputCount);
 +    //DCHECK_EQ(this->NodeBase::input_count(), kInputCount);
    }
  };
  
 diff --git a/src/utils/allocation.cc b/src/utils/allocation.cc
-index dc8a3696fa..50bcba0a3b 100644
+index 9fe80b267d2..2b0890aaebd 100644
 --- a/src/utils/allocation.cc
 +++ b/src/utils/allocation.cc
-@@ -64,8 +64,10 @@ const int kAllocationTries = 2;
+@@ -67,8 +67,10 @@ const int kAllocationTries = 2;
  }  // namespace
  
  v8::PageAllocator* GetPlatformPageAllocator() {
@@ -159,7 +133,7 @@ index dc8a3696fa..50bcba0a3b 100644
  
  v8::VirtualAddressSpace* GetPlatformVirtualAddressSpace() {
 diff --git a/third_party/googletest/BUILD.gn b/third_party/googletest/BUILD.gn
-index 1cf84b3d8f..d5c5ec9521 100644
+index 1cf84b3d8f4..d5c5ec9521e 100644
 --- a/third_party/googletest/BUILD.gn
 +++ b/third_party/googletest/BUILD.gn
 @@ -88,8 +88,8 @@ source_set("gtest") {
@@ -174,7 +148,7 @@ index 1cf84b3d8f..d5c5ec9521 100644
    # V8-only workaround for http://crbug.com/chromium/1191946. Ensures that
    # googletest is compiled with the same visibility such as the rest of V8, see
 diff --git a/tools/v8windbg/BUILD.gn b/tools/v8windbg/BUILD.gn
-index 3bb1ee25e6..b1c31172d4 100644
+index f33de70b304..18a3e038d69 100644
 --- a/tools/v8windbg/BUILD.gn
 +++ b/tools/v8windbg/BUILD.gn
 @@ -23,7 +23,7 @@ source_set("v8windbg_base") {

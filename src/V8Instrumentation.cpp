@@ -165,6 +165,10 @@ void V8Instrumentation::writeBasicBlockProfileTraceToFile(const std::string &fil
   std::abort();
 }
 
+void V8Instrumentation::dumpOpcodeStats(std::ostream & /*os*/) const {
+  // No-op: V8 does not expose per-opcode stats in a form usable here.
+}
+
 void V8Instrumentation::dumpProfilerSymbolsToFile(const std::string &fileName) const {
   std::abort();
 }

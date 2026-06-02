@@ -39,17 +39,17 @@ struct ContextEmbedderIndex {
 
 // String utilities
 std::string JSStringToSTLString(v8::Isolate *isolate, v8::Local<v8::String> string) {
-  int utfLen = string->Utf8Length(isolate);
+  size_t utfLen = string->Utf8LengthV2(isolate);
   std::string result;
   result.resize(utfLen);
-  string->WriteUtf8(isolate, &result[0], utfLen);
+  string->WriteUtf8V2(isolate, result.data(), utfLen);
   return result;
 }
 
 std::u16string JSStringToStlU16String(v8::Isolate *isolate, v8::Local<v8::String> string) {
-  int utf16Len = string->Length();
+  uint32_t utf16Len = static_cast<uint32_t>(string->Length());
   std::u16string result(utf16Len, '\0');
-  string->Write(isolate, reinterpret_cast<uint16_t *>(&result[0]), 0, utf16Len, v8::String::NO_NULL_TERMINATION);
+  string->WriteV2(isolate, 0, utf16Len, reinterpret_cast<uint16_t *>(result.data()));
   return result;
 }
 
@@ -318,8 +318,10 @@ void V8Runtime::createHostObjectConstructorPerContext() {
 
   // V8 distinguishes between named properties (strings and symbols) and indexed properties (number)
   // Note that we're not passing an Enumerator here, otherwise we'd be double-counting since JSI doesn't make the
-  // distinction
-  hostObjectTemplate->SetIndexedPropertyHandler(HostObjectProxy::GetIndexed, HostObjectProxy::SetIndexed);
+  // distinction. V8 14.x replaced SetIndexedPropertyHandler with the unified
+  // SetHandler(IndexedPropertyHandlerConfiguration(...)) overload.
+  hostObjectTemplate->SetHandler(v8::IndexedPropertyHandlerConfiguration(
+      HostObjectProxy::GetIndexed, HostObjectProxy::SetIndexed));
   hostObjectTemplate->SetInternalFieldCount(1);
   host_object_constructor_.Reset(
       GetIsolate(), constructorForHostObjectTemplate->GetFunction(GetContextLocal()).ToLocalChecked());
@@ -594,7 +596,7 @@ V8Runtime::ExecuteString(const v8::Local<v8::String> &source, const std::string 
 
   v8::Local<v8::String> urlV8String =
       v8::String::NewFromUtf8(GetIsolate(), reinterpret_cast<const char *>(sourceURL.c_str())).ToLocalChecked();
-  v8::ScriptOrigin origin(GetIsolate(), urlV8String);
+  v8::ScriptOrigin origin(urlV8String);
 
   v8::Local<v8::Script> script;
 
@@ -679,7 +681,7 @@ std::shared_ptr<const facebook::jsi::PreparedJavaScript> V8Runtime::prepareJavaS
 
   v8::Local<v8::String> urlV8String =
       v8::String::NewFromUtf8(GetIsolate(), reinterpret_cast<const char *>(sourceURL.c_str())).ToLocalChecked();
-  v8::ScriptOrigin origin(GetIsolate(), urlV8String);
+  v8::ScriptOrigin origin(urlV8String);
   v8::Local<v8::Script> script;
   v8::ScriptCompiler::CompileOptions options = v8::ScriptCompiler::CompileOptions::kNoCompileOptions;
   v8::ScriptCompiler::CachedData *cached_data = nullptr;
@@ -713,7 +715,7 @@ std::shared_ptr<const facebook::jsi::PreparedJavaScript> V8Runtime::prepareJavaS
 
   v8::Local<v8::String> urlV8String =
       v8::String::NewFromUtf8(GetIsolate(), reinterpret_cast<const char *>(sourceURL.c_str())).ToLocalChecked();
-  v8::ScriptOrigin origin(GetIsolate(), urlV8String);
+  v8::ScriptOrigin origin(urlV8String);
 
   v8::Local<v8::Script> script;
 
@@ -815,7 +817,7 @@ facebook::jsi::Value V8Runtime::evaluatePreparedJavaScript(
   v8::Local<v8::String> urlV8String =
       v8::String::NewFromUtf8(GetIsolate(), reinterpret_cast<const char *>(prepared->scriptSignature.url.c_str()))
           .ToLocalChecked();
-  v8::ScriptOrigin origin(GetIsolate(), urlV8String);
+  v8::ScriptOrigin origin(urlV8String);
   v8::Local<v8::Script> script;
 
   v8::ScriptCompiler::CompileOptions options = v8::ScriptCompiler::CompileOptions::kConsumeCodeCache;
@@ -875,13 +877,16 @@ void V8Runtime::ReportException(v8::TryCatch *try_catch) {
     // See also https://v8.dev/docs/stack-trace-api
     std::string stack = sstr.str();
     if (stack.find("Maximum call stack size exceeded") == std::string::npos) {
-      auto err = jsi::JSError(*this, ex_messages);
+      // Build the underlying JS Error value, attach the full V8 stack to its
+      // "stack" property, then construct the JSError with the stripped C++
+      // stack. The new jsi.h has no setStack() — the stack must be supplied
+      // at construction time via JSError(Value, message, stack).
+      auto initialErr = jsi::JSError(*this, ex_messages);
+      initialErr.value().getObject(*this).setProperty(
+          *this, "stack", facebook::jsi::String::createFromUtf8(*this, stack));
 
-      err.value().getObject(*this).setProperty(*this, "stack", facebook::jsi::String::createFromUtf8(*this, stack));
-
-      // The "stack" includes the message in V8, but JSI tracks the message and the callstack as 2 separate properties
-      // so let's strip it out The format of stack is "%ErrorType%: %Message%\n%Callstack%" where %Message% can
-      // include newline characters as well.
+      // The "stack" V8 emits includes the message; JSI tracks message and
+      // callstack separately, so strip the leading "ErrorType: <message>\n".
       auto numNewLines = std::count(ex_messages.cbegin(), ex_messages.cend(), '\n');
       auto endOfMessage = stack.find("\n");
       for (size_t j = 0; j < numNewLines; j++) {
@@ -889,8 +894,8 @@ void V8Runtime::ReportException(v8::TryCatch *try_catch) {
       }
       stack.erase(0, endOfMessage + 1);
 
-      err.setStack(stack);
-      throw err;
+      jsi::Value errValue = jsi::Value(*this, initialErr.value());
+      throw jsi::JSError(std::move(errValue), ex_messages, stack);
     } else {
       // If we're already in stack overflow, calling the Error constructor pushes it overboard
       throw jsi::JSError(*this, ex_messages, stack);
@@ -1103,7 +1108,7 @@ jsi::Object V8Runtime::createObject(std::shared_ptr<jsi::HostObject> hostobject)
   }
 
   newObject->SetInternalField(
-      0, v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostObjectProxy)));
+      0, v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostObjectProxy, v8::kExternalPointerTypeTagDefault)));
 
   AddHostObjectLifetimeTracker(std::make_shared<HostObjectLifetimeTracker>(*this, newObject, hostObjectProxy));
 
@@ -1114,7 +1119,7 @@ std::shared_ptr<jsi::HostObject> V8Runtime::getHostObject(const jsi::Object &obj
   IsolateLocker isolate_locker(this);
   v8::Local<v8::External> internalField =
       v8::Local<v8::External>::Cast(objectRef(obj)->GetInternalField(0).As<v8::Value>());
-  HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(internalField->Value());
+  HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(internalField->Value(v8::kExternalPointerTypeTagDefault));
   return hostObjectProxy->getHostObject();
 }
 
@@ -1201,11 +1206,11 @@ bool V8Runtime::isHostObject(const jsi::Object &obj) const {
   }
 
   v8::Local<v8::External> internalField = v8::Local<v8::External>::Cast(internalFieldRef);
-  if (!internalField->Value()) {
+  if (!internalField->Value(v8::kExternalPointerTypeTagDefault)) {
     return false;
   }
 
-  HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(internalField->Value());
+  HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(internalField->Value(v8::kExternalPointerTypeTagDefault));
 
   for (const std::shared_ptr<HostObjectLifetimeTracker> &hostObjectLifetimeTracker :
        host_object_lifetime_tracker_list_) {
@@ -1284,7 +1289,7 @@ jsi::Function V8Runtime::createFunctionFromHostFunction(
   if (!v8::Function::New(
            GetContextLocal(),
            HostFunctionProxy::HostFunctionCallback,
-           v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostFunctionProxy)),
+           v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostFunctionProxy, v8::kExternalPointerTypeTagDefault)),
            paramCount)
            .ToLocal(&newFunction)) {
     throw jsi::JSError(*this, "Creation of HostFunction failed.");
@@ -1318,18 +1323,18 @@ namespace {
 std::string getFunctionName(v8::Isolate *isolate, v8::Local<v8::Function> func) {
   std::string functionNameStr;
   v8::Local<v8::String> functionNameV8Str = v8::Local<v8::String>::Cast(func->GetName());
-  int functionNameLength = functionNameV8Str->Utf8Length(isolate);
+  size_t functionNameLength = functionNameV8Str->Utf8LengthV2(isolate);
   if (functionNameLength > 0) {
     functionNameStr.resize(functionNameLength);
-    functionNameV8Str->WriteUtf8(isolate, &functionNameStr[0]);
+    functionNameV8Str->WriteUtf8V2(isolate, functionNameStr.data(), functionNameLength);
   }
 
   if (functionNameV8Str.IsEmpty()) {
     functionNameV8Str = v8::Local<v8::String>::Cast(func->GetInferredName());
-    functionNameLength = functionNameV8Str->Utf8Length(isolate);
+    functionNameLength = functionNameV8Str->Utf8LengthV2(isolate);
     if (functionNameLength > 0) {
       functionNameStr.resize(functionNameLength);
-      functionNameV8Str->WriteUtf8(isolate, &functionNameStr[0]);
+      functionNameV8Str->WriteUtf8V2(isolate, functionNameStr.data(), functionNameLength);
     }
   }
 
@@ -1696,7 +1701,7 @@ void V8Runtime::setNativeState(
     holder->setNativeState(std::move(nativeState));
   } else {
     holder = new NativeStateHolder(GetIsolate(), v8Object, std::move(nativeState));
-    v8::Local<v8::External> external = v8::External::New(GetIsolate(), holder);
+    v8::Local<v8::External> external = v8::External::New(GetIsolate(), holder, v8::kExternalPointerTypeTagDefault);
     v8Object->SetPrivate(GetContextLocal(), nativeStateKey(), external).Check();
   }
 }
@@ -1711,7 +1716,7 @@ NativeStateHolder *V8Runtime::getNativeStateHolder(v8::Local<v8::Object> v8Objec
     return nullptr;
   }
   v8::Local<v8::External> external = val.As<v8::External>();
-  return static_cast<NativeStateHolder *>(external->Value());
+  return static_cast<NativeStateHolder *>(external->Value(v8::kExternalPointerTypeTagDefault));
 }
 
 #endif
@@ -1840,8 +1845,8 @@ std::unique_ptr<UnhandledPromiseRejection> V8Runtime::GetAndClearLastUnhandledPr
   }
 
   v8::Local<v8::Promise> promise = data.GetPromise();
-  v8::Isolate *isolate = promise->GetIsolate();
-  v8::MaybeLocal<v8::Context> context = promise->GetCreationContext();
+  v8::Isolate *isolate = v8::Isolate::GetCurrent();
+  v8::MaybeLocal<v8::Context> context = promise->GetCreationContext(isolate);
 
   if (context.IsEmpty()) {
     return;

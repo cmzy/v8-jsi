@@ -317,9 +317,9 @@ class NodeApiEnv : public napi_env__ {
 
     const char* checked_source_url = source_url ? source_url : "";
     v8::Local<v8::String> urlV8String =
-        v8::String::NewFromUtf8(context->GetIsolate(), checked_source_url)
+        v8::String::NewFromUtf8(env->isolate, checked_source_url)
             .ToLocalChecked();
-    v8::ScriptOrigin origin(context->GetIsolate(), urlV8String);
+    v8::ScriptOrigin origin(urlV8String);
 
     auto maybe_script = v8::Script::Compile(
         context, v8::Local<v8::String>::Cast(v8_source), &origin);

@@ -525,9 +525,9 @@ std::unique_ptr<v8_inspector::StringBuffer> ToProtocolString(
     return v8_inspector::StringBuffer::create(v8_inspector::StringView());
   }
   v8::Local<v8::String> string_value = v8::Local<v8::String>::Cast(value);
-  int len = string_value->Length();
+  uint32_t len = static_cast<uint32_t>(string_value->Length());
   std::basic_string<uint16_t> buffer(len, '\0');
-  string_value->Write(v8::Isolate::GetCurrent(), &buffer[0], 0, len);
+  string_value->WriteV2(v8::Isolate::GetCurrent(), 0, len, buffer.data());
   return v8_inspector::StringBuffer::create(
       v8_inspector::StringView(buffer.data(), len));
 }

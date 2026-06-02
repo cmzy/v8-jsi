@@ -1,5 +1,9 @@
 #pragma once
 
+#ifndef JSI_VERSION
+#define JSI_VERSION 19
+#endif
+
 #include <jsi/instrumentation.h>
 #include <v8.h>
 
@@ -28,6 +32,7 @@ class V8Instrumentation : public facebook::jsi::Instrumentation {
 #endif
   std::string flushAndDisableBridgeTrafficTrace() override;
   void writeBasicBlockProfileTraceToFile(const std::string &fileName) const override;
+  void dumpOpcodeStats(std::ostream &os) const override;
   void dumpProfilerSymbolsToFile(const std::string &fileName) const override;
 
  private:

@@ -2,6 +2,36 @@
 // Licensed under the MIT license.
 #pragma once
 
+// Compatibility shims for the JSI version-gating macros. Upstream jsi.h
+// (imported from Hermes) does not define JSI_VERSION or the JSI_CONST_*/
+// JSI_NO_CONST_*/JSI_NOEXCEPT_* macros — they are expected to come from the
+// embedder. We replicate the same set used by NodeApiJsiRuntime.cpp so that
+// override signatures using these markers match jsi.h's base declarations.
+#ifndef JSI_VERSION
+#define JSI_VERSION 19
+#endif
+#ifndef JSI_NO_CONST_3
+#if JSI_VERSION >= 3
+#define JSI_NO_CONST_3
+#else
+#define JSI_NO_CONST_3 const
+#endif
+#endif
+#ifndef JSI_CONST_10
+#if JSI_VERSION >= 10
+#define JSI_CONST_10 const
+#else
+#define JSI_CONST_10
+#endif
+#endif
+#ifndef JSI_NOEXCEPT_15
+#if JSI_VERSION >= 15
+#define JSI_NOEXCEPT_15 noexcept
+#else
+#define JSI_NOEXCEPT_15
+#endif
+#endif
+
 #include "node-api/env-inl.h"
 #include "node-api/js_runtime_api.h"
 #include "public/V8JsiRuntime.h"
@@ -273,7 +303,15 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
 
   class HostObjectProxy : public IHostProxy {
    private:
-    static void GetInternal(const facebook::jsi::PropNameID &propId, const v8::PropertyCallbackInfo<v8::Value> &info) {
+    // V8 14.x changed interceptor callbacks to return v8::Intercepted
+    // (kYes = handled, kNo = fall through to default lookup) and changed
+    // the setter's PropertyCallbackInfo template parameter from <Value> to
+    // <void> (named) / <Boolean> (indexed). GetInternal/SetInternal are
+    // templated on the PropertyCallbackInfo's T so both flavours can share
+    // the same body — they never touch T-specific methods.
+    static v8::Intercepted GetInternal(
+        const facebook::jsi::PropNameID &propId,
+        const v8::PropertyCallbackInfo<v8::Value> &info) {
       HostObjectProxy *hostObjectProxy = GetHostObjectProxy(info);
       V8Runtime &runtime = hostObjectProxy->runtime_;
       std::shared_ptr<facebook::jsi::HostObject> hostObject = hostObjectProxy->hostObject_;
@@ -286,7 +324,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
 
         // Schedule to throw the exception back to JS.
         info.GetIsolate()->ThrowException(runtime.valueReference(error.value()));
-        return;
+        return v8::Intercepted::kYes;
       } catch (const std::exception &ex) {
         info.GetReturnValue().Set(v8::Undefined(info.GetIsolate()));
 
@@ -294,7 +332,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
         v8::Local<v8::String> message =
             v8::String::NewFromUtf8(info.GetIsolate(), ex.what(), v8::NewStringType::kNormal).ToLocalChecked();
         info.GetIsolate()->ThrowException(v8::Exception::Error(message));
-        return;
+        return v8::Intercepted::kYes;
       } catch (...) {
         info.GetReturnValue().Set(v8::Undefined(info.GetIsolate()));
 
@@ -306,16 +344,18 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
                 v8::NewStringType::kNormal)
                 .ToLocalChecked();
         info.GetIsolate()->ThrowException(v8::Exception::Error(message));
-        return;
+        return v8::Intercepted::kYes;
       }
 
       info.GetReturnValue().Set(runtime.valueReference(result));
+      return v8::Intercepted::kYes;
     }
 
-    static void SetInternal(
+    template <typename T>
+    static v8::Intercepted SetInternal(
         const facebook::jsi::PropNameID &propId,
         v8::Local<v8::Value> value,
-        const v8::PropertyCallbackInfo<v8::Value> &info) {
+        const v8::PropertyCallbackInfo<T> &info) {
       HostObjectProxy *hostObjectProxy = GetHostObjectProxy(info);
       V8Runtime &runtime = hostObjectProxy->runtime_;
       std::shared_ptr<facebook::jsi::HostObject> hostObject = hostObjectProxy->hostObject_;
@@ -340,10 +380,15 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
                 .ToLocalChecked();
         info.GetIsolate()->ThrowException(v8::Exception::Error(message));
       }
+      return v8::Intercepted::kYes;
     }
 
-    static HostObjectProxy *GetHostObjectProxy(const v8::PropertyCallbackInfo<v8::Value> &info) {
-      v8::Local<v8::Object> obj = info.This();
+    // Reach the HostObjectProxy stored in the holder's internal field. The
+    // PropertyCallbackInfo template parameter varies across interceptor
+    // signatures (Value/void/Boolean/Array), so the helper is templated.
+    template <typename T>
+    static HostObjectProxy *GetHostObjectProxy(const v8::PropertyCallbackInfo<T> &info) {
+      v8::Local<v8::Object> obj = info.Holder();
       while (obj->InternalFieldCount() != 1) {
         // Walk the prototype chain
         v8::Local<v8::Value> proto = obj->GetPrototype();
@@ -352,7 +397,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
       v8::Local<v8::Value> externalValue = obj->GetInternalField(0).As<v8::Value>();
 
       v8::Local<v8::External> data = v8::Local<v8::External>::Cast(externalValue);
-      HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(data->Value());
+      HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(data->Value(v8::kExternalPointerTypeTagDefault));
 
       if (hostObjectProxy == nullptr) {
         std::abort();
@@ -361,15 +406,19 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
     }
 
    public:
-    static void Get(v8::Local<v8::Name> v8PropName, const v8::PropertyCallbackInfo<v8::Value> &info) {
+    // V8 14.x interceptor callbacks return v8::Intercepted (kYes when the
+    // handler has produced a result, kNo to fall through to the default
+    // lookup). The named setter takes PropertyCallbackInfo<void>, the
+    // indexed setter takes PropertyCallbackInfo<Boolean>.
+    static v8::Intercepted Get(v8::Local<v8::Name> v8PropName, const v8::PropertyCallbackInfo<v8::Value> &info) {
       V8Runtime &runtime = GetHostObjectProxy(info)->runtime_;
       if (v8PropName->IsString()) {
-        GetInternal(
+        return GetInternal(
             make<facebook::jsi::PropNameID>(
                 V8StringValue::make(runtime.GetIsolate(), v8::Local<v8::String>::Cast(v8PropName))),
             info);
       } else if (v8PropName->IsSymbol()) {
-        GetInternal(
+        return GetInternal(
             make<facebook::jsi::PropNameID>(
                 V8SymbolValue::make(runtime.GetIsolate(), v8::Local<v8::Symbol>::Cast(v8PropName))),
             info);
@@ -378,25 +427,25 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
       }
     }
 
-    static void GetIndexed(uint32_t index, const v8::PropertyCallbackInfo<v8::Value> &info) {
+    static v8::Intercepted GetIndexed(uint32_t index, const v8::PropertyCallbackInfo<v8::Value> &info) {
       std::string propName = std::to_string(index);
       V8Runtime &runtime = GetHostObjectProxy(info)->runtime_;
-      GetInternal(
+      return GetInternal(
           facebook::jsi::PropNameID::forString(runtime, facebook::jsi::String::createFromUtf8(runtime, propName)),
           info);
     }
 
-    static void
-    Set(v8::Local<v8::Name> v8PropName, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<v8::Value> &info) {
+    static v8::Intercepted
+    Set(v8::Local<v8::Name> v8PropName, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<void> &info) {
       V8Runtime &runtime = GetHostObjectProxy(info)->runtime_;
       if (v8PropName->IsString()) {
-        SetInternal(
+        return SetInternal(
             make<facebook::jsi::PropNameID>(
                 V8StringValue::make(runtime.GetIsolate(), v8::Local<v8::String>::Cast(v8PropName))),
             value,
             info);
       } else if (v8PropName->IsSymbol()) {
-        SetInternal(
+        return SetInternal(
             make<facebook::jsi::PropNameID>(
                 V8SymbolValue::make(runtime.GetIsolate(), v8::Local<v8::Symbol>::Cast(v8PropName))),
             value,
@@ -406,19 +455,19 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
       }
     }
 
-    static void
-    SetIndexed(uint32_t index, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<v8::Value> &info) {
+    static v8::Intercepted
+    SetIndexed(uint32_t index, v8::Local<v8::Value> value, const v8::PropertyCallbackInfo<v8::Boolean> &info) {
       std::string propName = std::to_string(index);
       V8Runtime &runtime = GetHostObjectProxy(info)->runtime_;
-      SetInternal(
+      return SetInternal(
           facebook::jsi::PropNameID::forString(runtime, facebook::jsi::String::createFromUtf8(runtime, propName)),
           value,
           info);
     }
 
     static void Enumerator(const v8::PropertyCallbackInfo<v8::Array> &info) {
-      v8::Local<v8::External> data = v8::Local<v8::External>::Cast(info.This()->GetInternalField(0).As<v8::Value>());
-      HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(data->Value());
+      v8::Local<v8::External> data = v8::Local<v8::External>::Cast(info.Holder()->GetInternalField(0).As<v8::Value>());
+      HostObjectProxy *hostObjectProxy = reinterpret_cast<HostObjectProxy *>(data->Value(v8::kExternalPointerTypeTagDefault));
 
       if (hostObjectProxy != nullptr) {
         V8Runtime &runtime = hostObjectProxy->runtime_;
@@ -513,7 +562,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
 
       v8::HandleScope handle_scope(v8::Isolate::GetCurrent());
       v8::Local<v8::External> data = v8::Local<v8::External>::Cast(info.Data());
-      HostFunctionProxy *hostFunctionProxy = reinterpret_cast<HostFunctionProxy *>(data->Value());
+      HostFunctionProxy *hostFunctionProxy = reinterpret_cast<HostFunctionProxy *>(data->Value(v8::kExternalPointerTypeTagDefault));
       hostFunctionProxy->call(*hostFunctionProxy, info);
 
       TRACEV8RUNTIME_VERBOSE("HostFunctionCallback", TraceLoggingString("end", "op"));

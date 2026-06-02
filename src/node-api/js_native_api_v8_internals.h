@@ -51,6 +51,12 @@
 #include "V8JsiRuntime_impl.h"
 #include "util-inl.h"
 
+#ifdef _WIN32
+#include <process.h>  // for _exit
+#else
+#include <unistd.h>   // for _exit
+#endif
+
 #define NAPI_ARRAYSIZE(array) node::arraysize((array))
 
 #define NAPI_PRIVATE_KEY(context, suffix)                                      \

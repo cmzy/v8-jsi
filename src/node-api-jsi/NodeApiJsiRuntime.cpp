@@ -8,6 +8,7 @@
 #include <jsi/instrumentation.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -271,6 +272,10 @@ class NodeApiJsiInstrumentation : public facebook::jsi::Instrumentation {
 
   void writeBasicBlockProfileTraceToFile(const std::string &fileName) const override {
     std::abort();
+  }
+
+  void dumpOpcodeStats(std::ostream & /*os*/) const override {
+    // No-op: opcode stats are not exposed through node-api.
   }
 
   void dumpProfilerSymbolsToFile(const std::string &fileName) const override {

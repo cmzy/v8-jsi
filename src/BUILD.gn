@@ -162,10 +162,15 @@ target("executable", "jsitests") {
 
   deps = [
     ":v8jsi",
-    "node-api/test:node_api_tests",
-    "//build/win:default_exe_manifest",
     "//testing/gtest",
   ]
+
+  if (is_win) {
+    deps += [
+      "node-api/test:node_api_tests",
+      "//build/win:default_exe_manifest",
+    ]
+  }
 
   configs += [
     "//:toolchain",

@@ -354,7 +354,8 @@ inline napi_status Unwrap(napi_env env,
                  .ToLocalChecked();
   RETURN_STATUS_IF_FALSE(env, val->IsExternal(), napi_invalid_arg);
   Reference* reference =
-      static_cast<v8impl::Reference*>(val.As<v8::External>()->Value());
+      static_cast<v8impl::Reference*>(
+          val.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
 
   if (result) {
     *result = reference->Data();
@@ -394,14 +395,16 @@ class CallbackBundle {
     bundle->cb_data = data;
     bundle->env = env;
 
-    v8::Local<v8::Value> cbdata = v8::External::New(env->isolate, bundle);
+    v8::Local<v8::Value> cbdata = v8::External::New(
+        env->isolate, bundle, v8::kExternalPointerTypeTagDefault);
     ReferenceWithFinalizer::New(
         env, cbdata, 0, ReferenceOwnership::kRuntime, Delete, bundle, nullptr);
     return cbdata;
   }
 
   static CallbackBundle* FromCallbackData(v8::Local<v8::Value> data) {
-    return reinterpret_cast<CallbackBundle*>(data.As<v8::External>()->Value());
+    return reinterpret_cast<CallbackBundle*>(
+        data.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
   }
 
  public:
@@ -574,7 +577,8 @@ inline napi_status Wrap(napi_env env,
 
   CHECK(obj->SetPrivate(context,
                         NAPI_PRIVATE_KEY(context, wrapper),
-                        v8::External::New(env->isolate, reference))
+                        v8::External::New(env->isolate, reference,
+                                          v8::kExternalPointerTypeTagDefault))
             .FromJust());
 
   return GET_RETURN_STATUS(env);
@@ -841,7 +845,8 @@ class ExternalWrapper {
  public:
   static v8::Local<v8::External> New(napi_env env, void* data) {
     ExternalWrapper* wrapper = new ExternalWrapper(data);
-    v8::Local<v8::External> external = v8::External::New(env->isolate, wrapper);
+    v8::Local<v8::External> external = v8::External::New(
+        env->isolate, wrapper, v8::kExternalPointerTypeTagDefault);
     wrapper->persistent_.Reset(env->isolate, external);
     wrapper->persistent_.SetWeak(
         wrapper, WeakCallback, v8::WeakCallbackType::kParameter);
@@ -850,7 +855,8 @@ class ExternalWrapper {
   }
 
   static ExternalWrapper* From(v8::Local<v8::External> external) {
-    return static_cast<ExternalWrapper*>(external->Value());
+    return static_cast<ExternalWrapper*>(
+        external->Value(v8::kExternalPointerTypeTagDefault));
   }
 
   void* Data() { return data_; }
@@ -2427,12 +2433,12 @@ napi_status NAPI_CDECL napi_get_value_string_latin1(
     CHECK_ARG(env, result);
     *result = val.As<v8::String>()->Length();
   } else if (bufsize != 0) {
-    int copied =
-        val.As<v8::String>()->WriteOneByte(env->isolate,
-                                           reinterpret_cast<uint8_t*>(buf),
-                                           0,
-                                           bufsize - 1,
-                                           v8::String::NO_NULL_TERMINATION);
+    uint32_t string_len = static_cast<uint32_t>(val.As<v8::String>()->Length());
+    uint32_t copied = std::min(string_len, static_cast<uint32_t>(bufsize - 1));
+    val.As<v8::String>()->WriteOneByteV2(env->isolate,
+                                         0,
+                                         copied,
+                                         reinterpret_cast<uint8_t*>(buf));
 
     buf[copied] = '\0';
     if (result != nullptr) {
@@ -2463,14 +2469,13 @@ napi_status NAPI_CDECL napi_get_value_string_utf8(
 
   if (!buf) {
     CHECK_ARG(env, result);
-    *result = val.As<v8::String>()->Utf8Length(env->isolate);
+    *result = val.As<v8::String>()->Utf8LengthV2(env->isolate);
   } else if (bufsize != 0) {
-    int copied = val.As<v8::String>()->WriteUtf8(
+    size_t copied = val.As<v8::String>()->WriteUtf8V2(
         env->isolate,
         buf,
         bufsize - 1,
-        nullptr,
-        v8::String::REPLACE_INVALID_UTF8 | v8::String::NO_NULL_TERMINATION);
+        v8::String::WriteFlags::kReplaceInvalidUtf8);
 
     buf[copied] = '\0';
     if (result != nullptr) {
@@ -2507,11 +2512,12 @@ napi_status NAPI_CDECL napi_get_value_string_utf16(napi_env env,
     // V8 assumes UTF-16 length is the same as the number of characters.
     *result = val.As<v8::String>()->Length();
   } else if (bufsize != 0) {
-    int copied = val.As<v8::String>()->Write(env->isolate,
-                                             reinterpret_cast<uint16_t*>(buf),
-                                             0,
-                                             bufsize - 1,
-                                             v8::String::NO_NULL_TERMINATION);
+    uint32_t string_len = static_cast<uint32_t>(val.As<v8::String>()->Length());
+    uint32_t copied = std::min(string_len, static_cast<uint32_t>(bufsize - 1));
+    val.As<v8::String>()->WriteV2(env->isolate,
+                                  0,
+                                  copied,
+                                  reinterpret_cast<uint16_t*>(buf));
 
     buf[copied] = '\0';
     if (result != nullptr) {
