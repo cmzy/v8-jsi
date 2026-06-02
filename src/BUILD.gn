@@ -37,6 +37,7 @@ target("shared_library", "v8jsi") {
     "V8Instrumentation.h",
     "V8JsiRuntime.cpp",
     "V8JsiRuntime_impl.h",
+    "V8StructuredClone.cpp",
     "jsi/JSIDynamic.h",
     "jsi/decorator.h",
     "jsi/instrumentation.h",
@@ -48,6 +49,7 @@ target("shared_library", "v8jsi") {
     "jsi/threadsafe.h",
     "public/ScriptStore.h",
     "public/V8JsiRuntime.h",
+    "public/V8StructuredClone.h",
   ]
 
   if (v8jsi_enable_node_api) {

@@ -5,6 +5,7 @@
 #include "node-api/env-inl.h"
 #include "node-api/js_runtime_api.h"
 #include "public/V8JsiRuntime.h"
+#include "public/V8StructuredClone.h"
 #include "public/compat.h"
 
 #include "V8Windows.h"
@@ -44,17 +45,21 @@ class NativeStateHolder;
 class V8PlatformHolder {
  public:
   // thread_pool_size of 0 is the default (V8 will use the number of cores N to compute it as min(N-1, 16))
+  // Returns true if this call actually initialized V8 (first-call winner), false if a previous
+  // call already did so. Callers can use the return value to detect when one-shot init inputs
+  // (e.g. V8 command-line flags) were not applied because the platform was already initialized.
   template <typename InitAction>
-  static void initializePlatform(int thread_pool_size, InitAction&& init) {
+  static bool initializePlatform(int thread_pool_size, InitAction&& init) {
     std::lock_guard<std::mutex> guard(mutex_s_);
     if (is_initialized_s_) {
-      return;
+      return false;
     }
     is_initialized_s_ = true;
     init();
     platform_s_ = v8::platform::NewDefaultPlatform(thread_pool_size);
     v8::V8::InitializePlatform(platform_s_.get());
     v8::V8::Initialize();
+    return true;
   }
 
   static void disposePlatform() {
@@ -87,10 +92,41 @@ struct UnhandledPromiseRejection {
 
 extern std::string JSStringToSTLString(v8::Isolate *isolate, v8::Local<v8::String> string);
 
-class V8Runtime : public facebook::jsi::Runtime {
+namespace detail {
+// Forward declarations so V8Runtime can friend them. Defined in
+// V8StructuredClone.cpp.
+struct SerializerDelegate;
+struct DeserializerDelegate;
+} // namespace detail
+
+class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredClone {
  public:
   V8Runtime(V8RuntimeArgs &&args);
   ~V8Runtime() override;
+
+  // ICast: route v8runtime-specific interfaces (IStructuredClone, ...) before
+  // delegating to jsi::Runtime's default no-op implementation.
+  facebook::jsi::ICast *castInterface(const facebook::jsi::UUID &uuid) override;
+
+  // IStructuredClone implementation. Defined in V8StructuredClone.cpp.
+  std::vector<uint8_t> serialize(
+      facebook::jsi::Runtime &rt,
+      const facebook::jsi::Value &value,
+      const std::vector<facebook::jsi::Value> &transfer,
+      v8runtime::IHostObjectCodec &codec) override;
+  facebook::jsi::Value deserialize(
+      facebook::jsi::Runtime &rt,
+      const uint8_t *data,
+      size_t len,
+      v8runtime::IHostObjectCodec &codec) override;
+
+ private:
+  // The serialize/deserialize implementations live in a separate translation
+  // unit. They need access to objectRef / valueReference / createValue /
+  // IsolateLocker / V8ObjectValue, which would otherwise require widening
+  // their visibility. Granting friendship is the smaller blast radius.
+  friend struct v8runtime::detail::SerializerDelegate;
+  friend struct v8runtime::detail::DeserializerDelegate;
 
  public: // Used by openInspector public API.
 #if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)

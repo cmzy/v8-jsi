@@ -4,6 +4,8 @@
 
 #include <jsi/jsi.h>
 #include <memory>
+#include <string>
+#include <vector>
 
 #ifndef V8JSI_EXPORT
 #ifdef _MSC_VER
@@ -98,6 +100,16 @@ struct V8RuntimeArgs {
     } flags;
     uint32_t _flagspad{0};
   };
+
+  // Extra V8 command-line flags appended verbatim to v8::V8::SetFlagsFromCommandLine.
+  // Examples: "--js-float16array", "--harmony-temporal", "--max-old-space-size=512",
+  //           "--no-sparkplug" (boolean flags accept the "--no-" prefix to disable).
+  //
+  // IMPORTANT: V8 flags can only be set before V8 is initialized for the first time
+  // in the host process. The first makeV8Runtime() call wins; any extraV8Flags passed
+  // to later calls are ignored (a TRACEV8RUNTIME_WARNING is emitted in that case).
+  // Unknown flags are silently dropped by V8 (it may print to stderr).
+  std::vector<std::string> extraV8Flags;
 };
 
 V8JSI_EXPORT std::unique_ptr<facebook::jsi::Runtime> __cdecl makeV8Runtime(V8RuntimeArgs &&args);

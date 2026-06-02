@@ -326,7 +326,7 @@ void V8Runtime::createHostObjectConstructorPerContext() {
 }
 
 void V8Runtime::initializeV8() {
-  V8PlatformHolder::initializePlatform(args_.flags.thread_pool_size, [this]() {
+  bool init_ran = V8PlatformHolder::initializePlatform(args_.flags.thread_pool_size, [this]() {
 #ifdef _WIN32
     globalInitializeTracing();
 
@@ -364,9 +364,24 @@ void V8Runtime::initializeV8() {
     if (args_.flags.lite_mode)
       argv.push_back("--lite_mode");
 
+    // Caller-supplied extra V8 command-line flags. The c_str() pointers stay valid as long as
+    // args_.extraV8Flags is not mutated, which is guaranteed for the duration of this lambda.
+    for (const std::string &flag : args_.extraV8Flags) {
+      argv.push_back(flag.c_str());
+    }
+
     int argc = static_cast<int>(argv.size());
     v8::V8::SetFlagsFromCommandLine(&argc, const_cast<char **>(&argv[0]), false);
   });
+
+  // If V8 was already initialized by an earlier makeV8Runtime call, any flags
+  // in this call's extraV8Flags were silently dropped. Surface that explicitly.
+  if (!init_ran && !args_.extraV8Flags.empty()) {
+    TRACEV8RUNTIME_WARNING(
+        "extraV8Flags ignored: V8 platform was already initialized by an earlier makeV8Runtime call",
+        TraceLoggingInt32(static_cast<int32_t>(args_.extraV8Flags.size()), "ignored_flag_count"),
+        TraceLoggingString(args_.extraV8Flags.front().c_str(), "first_ignored_flag"));
+  }
 }
 
 V8Runtime::V8Runtime(V8RuntimeArgs &&args) : args_(std::move(args)) {
@@ -1783,6 +1798,13 @@ v8::Local<v8::Value> V8Runtime::valueReference(const jsi::Value &value) {
     // What are you?
     std::abort();
   }
+}
+
+jsi::ICast *V8Runtime::castInterface(const jsi::UUID &uuid) {
+  if (uuid == v8runtime::IStructuredClone::uuid) {
+    return static_cast<v8runtime::IStructuredClone *>(this);
+  }
+  return jsi::Runtime::castInterface(uuid);
 }
 
 // Adopted from Node.js code
