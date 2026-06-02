@@ -37,6 +37,15 @@ def _gn_arg_string(
         # `temporal_rs_*` undefined-symbol link errors. Embedders that need
         # Temporal can flip this back to true and add the dep explicitly.
         "v8_enable_temporal_support=false",
+        # V8 14 enables Chromium's PartitionAlloc as the process-wide
+        # malloc shim by default. That means libv8jsi.so's libcxx allocates
+        # std::string buffers from PartitionAlloc's pool, but consumers
+        # (jsitests, embedder apps) free() those buffers through glibc and
+        # crash with "free(): invalid size" on the PartitionAlloc address
+        # range. Disabling the allocator shim makes libv8jsi.so go through
+        # the system allocator and matches embedder expectations.
+        "use_partition_alloc_as_malloc=false",
+        "use_allocator_shim=false",
         "v8_use_external_startup_data=false",
         "treat_warnings_as_errors=false",
     ]

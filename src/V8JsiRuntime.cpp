@@ -38,12 +38,45 @@ struct ContextEmbedderIndex {
 /*static*/ bool V8PlatformHolder::is_disposed_s_{false};
 
 // String utilities
+//
+// Manual UTF-16 → UTF-8 to sidestep V8 14.8 WriteUtf8V2 for now (the test
+// suite reproduces a destructor-time free() crash with `0xNNNN0002d320`-
+// looking addresses when we route stack/message reads through WriteUtf8V2).
+// Going through WriteV2 + a hand-rolled encoder isolates the conversion to
+// libc-owned memory and lets us prove the failure mode.
 std::string JSStringToSTLString(v8::Isolate *isolate, v8::Local<v8::String> string) {
-  size_t utfLen = string->Utf8LengthV2(isolate);
-  std::string result;
-  result.resize(utfLen);
-  string->WriteUtf8V2(isolate, result.data(), utfLen);
-  return result;
+  uint32_t utf16Len = static_cast<uint32_t>(string->Length());
+  if (utf16Len == 0) return {};
+  std::u16string utf16(utf16Len, u'\0');
+  string->WriteV2(isolate, 0, utf16Len, reinterpret_cast<uint16_t *>(utf16.data()));
+  std::string out;
+  out.reserve(utf16Len);
+  for (uint32_t i = 0; i < utf16Len; ++i) {
+    uint32_t cp = utf16[i];
+    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < utf16Len) {
+      uint32_t low = utf16[i + 1];
+      if (low >= 0xDC00 && low <= 0xDFFF) {
+        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
+        ++i;
+      }
+    }
+    if (cp < 0x80) {
+      out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+      out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
+  }
+  return out;
 }
 
 std::u16string JSStringToStlU16String(v8::Isolate *isolate, v8::Local<v8::String> string) {
@@ -1320,29 +1353,17 @@ jsi::Object V8Runtime::createObjectWithPrototype(const jsi::Value &prototype) {
 #endif
 
 namespace {
+// Route every v8::String → std::string through the same trusted converter
+// so we can prove the V8 14.8 WriteUtf8V2 hypothesis once.
 std::string getFunctionName(v8::Isolate *isolate, v8::Local<v8::Function> func) {
-  std::string functionNameStr;
   v8::Local<v8::String> functionNameV8Str = v8::Local<v8::String>::Cast(func->GetName());
-  size_t functionNameLength = functionNameV8Str->Utf8LengthV2(isolate);
-  if (functionNameLength > 0) {
-    functionNameStr.resize(functionNameLength);
-    functionNameV8Str->WriteUtf8V2(isolate, functionNameStr.data(), functionNameLength);
-  }
-
   if (functionNameV8Str.IsEmpty()) {
     functionNameV8Str = v8::Local<v8::String>::Cast(func->GetInferredName());
-    functionNameLength = functionNameV8Str->Utf8LengthV2(isolate);
-    if (functionNameLength > 0) {
-      functionNameStr.resize(functionNameLength);
-      functionNameV8Str->WriteUtf8V2(isolate, functionNameStr.data(), functionNameLength);
-    }
   }
-
-  if (functionNameV8Str.IsEmpty()) {
-    functionNameStr = "<anonymous>";
+  if (functionNameV8Str.IsEmpty() || functionNameV8Str->Length() == 0) {
+    return "<anonymous>";
   }
-
-  return functionNameStr;
+  return JSStringToSTLString(isolate, functionNameV8Str);
 }
 } // namespace
 
