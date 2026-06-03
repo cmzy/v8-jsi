@@ -55,10 +55,10 @@ std::string StringViewToUtf8(const v8_inspector::StringView &view) {
 
 std::unique_ptr<v8_inspector::StringBuffer> Utf8ToStringView(
     const std::string &message) {
-  std::wstring wstr =
+  std::u16string s =
       inspector::utils::Utf8ToUtf16(message.data(), message.length());
   v8_inspector::StringView view(
-      reinterpret_cast<const uint16_t *>(wstr.c_str()), wstr.length());
+      reinterpret_cast<const uint16_t *>(s.data()), s.length());
   return v8_inspector::StringBuffer::create(view);
 }
 
@@ -357,13 +357,13 @@ void InspectorConsoleCall(const v8::FunctionCallbackInfo<v8::Value> &info) {
         config_object->Set(context, in_call_key, v8::True(isolate)).FromJust());
     CHECK(
         !inspector_method.As<v8::Function>()
-             ->Call(context, info.Holder(), static_cast<int>(call_args.size()), call_args.data())
+             ->Call(context, info.This(), static_cast<int>(call_args.size()), call_args.data())
              .IsEmpty());
   }
 
   v8::TryCatch try_catch(info.GetIsolate());
   static_cast<void>(node_method.As<v8::Function>()->Call(
-      context, info.Holder(), static_cast<int>(call_args.size()), call_args.data()));
+      context, info.This(), static_cast<int>(call_args.size()), call_args.data()));
   CHECK(config_object->Delete(context, in_call_key).FromJust());
   if (try_catch.HasCaught())
     try_catch.ReThrow();
@@ -526,7 +526,11 @@ std::unique_ptr<v8_inspector::StringBuffer> ToProtocolString(
   }
   v8::Local<v8::String> string_value = v8::Local<v8::String>::Cast(value);
   uint32_t len = static_cast<uint32_t>(string_value->Length());
-  std::basic_string<uint16_t> buffer(len, '\0');
+  // std::basic_string<uint16_t> needs char_traits<unsigned short>, which
+  // libc++ does not specialize (MSVC's STL is more permissive). Plain
+  // vector storage is sufficient since this buffer is only ever read as a
+  // raw uint16_t span.
+  std::vector<uint16_t> buffer(len, 0);
   string_value->WriteV2(v8::Isolate::GetCurrent(), 0, len, buffer.data());
   return v8_inspector::StringBuffer::create(
       v8_inspector::StringView(buffer.data(), len));

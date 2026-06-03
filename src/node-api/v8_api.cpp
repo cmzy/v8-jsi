@@ -696,7 +696,9 @@ class ConfigWrapper {
     args.flags.enableMultiThread = enableMultithreading_;
 
     args.inspectorPort = inspectorPort_;
-    args.debuggerRuntimeName = inspectorRuntimeName_;
+    // inspectorRuntimeName_ (std::string) owns the storage; pointer is valid
+    // for as long as this V8Api instance lives, which outlives makeV8Runtime.
+    args.debuggerRuntimeName = inspectorRuntimeName_.c_str();
 
     args.foreground_task_runner = taskRunner_;
 

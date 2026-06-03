@@ -21,7 +21,11 @@ inline constexpr size_t base64_encoded_size(size_t size) {
 size_t base64_encode(const char* src, size_t slen, char* dst, size_t dlen);
 
 std::string utf16toUTF8(const uint16_t* utf16String, size_t utf16Len) noexcept;
-std::wstring Utf8ToUtf16(const char* utf8, size_t utf8Len);
+// Returns std::u16string (guaranteed 16-bit code units) rather than
+// std::wstring so callers can portably feed v8_inspector::StringView, whose
+// 16-bit constructor takes uint16_t*. wchar_t is 16-bit on Windows but 32-bit
+// on POSIX, so the original wstring signature was Windows-only.
+std::u16string Utf8ToUtf16(const char* utf8, size_t utf8Len);
 
 static char ToLower(char c);
 std::string ToLower(const std::string& in);

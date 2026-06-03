@@ -19,6 +19,14 @@
     /* makeV8Runtime(V8RuntimeArgs&&) */
     _ZN9v8runtime13makeV8RuntimeEONS_13V8RuntimeArgsE;
 
+    /* openInspector(jsi::Runtime&) and openInspectors_toberemoved() —
+     * only emitted in the with-inspector variant, the noinspector build
+     * simply doesn't define them. The version script lists them
+     * unconditionally; absent symbols on the noinspector .so are
+     * silently ignored by lld. */
+    _ZN9v8runtime13openInspectorERN8facebook3jsi7RuntimeE;
+    _ZN9v8runtime26openInspectors_toberemovedEv;
+
     /* facebook::jsi::*  -- members, static members, typeinfo, vtable. */
     _ZN8facebook3jsi*;
     _ZNK8facebook3jsi*;

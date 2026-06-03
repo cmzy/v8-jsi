@@ -76,31 +76,35 @@ target("shared_library", "v8jsi") {
     ]
   }
 
+  # Inspector sources are platform-independent: TCP via Asio, HTTP via
+  # llhttp, WebSocket framing in pure C++. They were originally gated on
+  # is_win because the integration in V8JsiRuntime.cpp was Windows-only,
+  # but the wire layer itself compiles everywhere Asio does.
+  if (v8jsi_enable_inspector) {
+    sources += [
+      "inspector/inspector_agent.cpp",
+      "inspector/inspector_agent.h",
+      "inspector/inspector_socket.cpp",
+      "inspector/inspector_socket.h",
+      "inspector/inspector_socket_server.cpp",
+      "inspector/inspector_socket_server.h",
+      "inspector/inspector_tcp.cpp",
+      "inspector/inspector_tcp.h",
+      "inspector/inspector_utils.cpp",
+      "inspector/inspector_utils.h",
+      "inspector/llhttp.c",
+      "inspector/llhttp.h",
+      "inspector/llhttp_api.c",
+      "inspector/llhttp_http.c",
+    ]
+  }
+
   if (is_win) {
     sources += [
       "etw/tracing.cpp",
       "etw/tracing.h",
       "version_gen.rc",
     ]
-
-    if (v8jsi_enable_inspector) {
-      sources += [
-        "inspector/inspector_agent.cpp",
-        "inspector/inspector_agent.h",
-        "inspector/inspector_socket.cpp",
-        "inspector/inspector_socket.h",
-        "inspector/inspector_socket_server.cpp",
-        "inspector/inspector_socket_server.h",
-        "inspector/inspector_tcp.cpp",
-        "inspector/inspector_tcp.h",
-        "inspector/inspector_utils.cpp",
-        "inspector/inspector_utils.h",
-        "inspector/llhttp.c",
-        "inspector/llhttp.h",
-        "inspector/llhttp_api.c",
-        "inspector/llhttp_http.c",
-      ]
-    }
 
     ldflags = [
       "/OPT:REF",
@@ -231,6 +235,50 @@ target("shared_library", "v8jsi") {
 
   if (v8jsi_enable_inspector) {
     defines += [ "V8JSI_ENABLE_INSPECTOR" ]
+    # v8jsi inherits V8's no_rtti config (clang -fno-rtti / MSVC /GR-).
+    # Asio's any_executor and friends use typeid for type-erased executor
+    # introspection; without RTTI that fails to compile on clang. We don't
+    # touch any of those paths (just basic tcp::socket / io_context), so
+    # tell Asio to skip its typeid code paths instead of re-enabling RTTI
+    # for the whole shared library. Harmless on MSVC.
+    defines += [ "ASIO_NO_TYPEID" ]
+  }
+}
+
+# Tiny standalone host that boots a V8Runtime with the inspector enabled,
+# keeps the JS thread alive, and pumps any inspector-posted tasks. Used
+# for end-to-end smoke testing the DevTools wire (curl /json, attach Chrome
+# DevTools). Lives inside the V8 build so it picks up the exact same
+# toolchain / libc++ as libv8jsi.dylib — otherwise std:: layouts diverge
+# across the ABI boundary and V8RuntimeArgs reads as garbage.
+if (v8jsi_enable_inspector) {
+  target("executable", "inspector_smoke") {
+    testonly = true
+    deps = [ ":v8jsi" ]
+    configs += [
+      "//:toolchain",
+      "//:internal_config_base",
+      "//build/config/compiler:exceptions",
+      "//build/config/compiler:rtti",
+      ":hybrid_crt_swap",
+    ]
+    configs -= [
+      "//build/config/compiler:no_exceptions",
+      "//build/config/compiler:no_rtti",
+    ]
+    include_dirs = [
+      ".",
+      "jsi",
+      "public",
+    ]
+    sources = [
+      "inspector_smoke.cpp",
+      "jsi/jsi.cpp",
+      "jsi/jsi.h",
+    ]
+    if (is_mac || is_ios) {
+      ldflags = [ "-Wl,-flat_namespace" ]
+    }
   }
 }
 

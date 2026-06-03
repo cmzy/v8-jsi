@@ -3,9 +3,8 @@
 #pragma once
 
 #include <jsi/jsi.h>
+#include <cstddef>
 #include <memory>
-#include <string>
-#include <vector>
 
 #ifndef V8JSI_EXPORT
 #ifdef _MSC_VER
@@ -68,8 +67,16 @@ struct V8RuntimeArgs {
   size_t initial_heap_size_in_bytes{0};
   size_t maximum_heap_size_in_bytes{0};
 
-  // Set this to override the target name displayed in the debugger (to distinguish multiple parallel runtimes)
-  std::string debuggerRuntimeName;
+  // Set this to override the target name displayed in the debugger (to
+  // distinguish multiple parallel runtimes). Caller-owned C string that must
+  // outlive the makeV8Runtime() call; nullptr falls back to the default
+  // "JSIRuntime context".
+  //
+  // Was std::string in earlier versions. Replaced with a raw pointer so the
+  // struct's binary layout is identical across libc++ implementations —
+  // libv8jsi.{so,dylib} bundles its own libc++ and embedders frequently use
+  // the system one, and std::string sizes diverge across the two.
+  const char* debuggerRuntimeName{nullptr};
 
   // Padded to allow adding boolean flags without breaking the ABI
   union {
@@ -109,12 +116,18 @@ struct V8RuntimeArgs {
   // in the host process. The first makeV8Runtime() call wins; any extraV8Flags passed
   // to later calls are ignored (a TRACEV8RUNTIME_WARNING is emitted in that case).
   // Unknown flags are silently dropped by V8 (it may print to stderr).
-  std::vector<std::string> extraV8Flags;
+  //
+  // Caller-owned array; both the pointer array and the individual C strings
+  // must outlive the makeV8Runtime() call. Use {nullptr, 0} for "no flags".
+  // Was std::vector<std::string>; replaced for the same ABI-stability reason
+  // as debuggerRuntimeName.
+  const char* const* extraV8Flags{nullptr};
+  std::size_t extraV8FlagCount{0};
 };
 
 V8JSI_EXPORT std::unique_ptr<facebook::jsi::Runtime> __cdecl makeV8Runtime(V8RuntimeArgs &&args);
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
 V8JSI_EXPORT void openInspector(facebook::jsi::Runtime &runtime);
 
 // This API will be removed once we have a proper entry point for users to enable inspector on an active runtime.

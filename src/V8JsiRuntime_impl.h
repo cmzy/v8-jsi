@@ -43,7 +43,7 @@
 #include "v8.h"
 
 #include "IsolateData.h"
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
 #include "inspector/inspector_agent.h"
 #endif
 
@@ -159,7 +159,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
   friend struct v8runtime::detail::DeserializerDelegate;
 
  public: // Used by openInspector public API.
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
   std::shared_ptr<inspector::Agent> getInspectorAgent() {
     return inspector_agent_;
   }
@@ -878,7 +878,7 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
   v8::Local<v8::Value> valueReference(const facebook::jsi::Value &value);
   facebook::jsi::Value createValue(v8::Local<v8::Value> value) const;
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
   std::shared_ptr<inspector::Agent> inspector_agent_;
 #endif
 

@@ -3,9 +3,10 @@
 // This code is based on the old node inspector implementation. See LICENSE_NODE for Node.js' project license details
 #include "inspector_utils.h"
 
-// Only for MultibyteToWideChar .. Should be removed.
+// MultiByteToWideChar lives in <windows.h>; V8Windows.h is a no-op elsewhere.
 #include "V8Windows.h"
 
+#include <limits>
 #include <stdexcept>
 
 namespace inspector {
@@ -93,14 +94,18 @@ std::string utf16toUTF8(const uint16_t* utf16String, size_t utf16StringLen) noex
   return utf8String;
 }
 
-std::wstring Utf8ToUtf16(const char* utf8, size_t utf8Len)
+std::u16string Utf8ToUtf16(const char* utf8, size_t utf8Len)
 {
-  std::wstring utf16{};
+  std::u16string utf16{};
 
   if (utf8Len == 0)
   {
     return utf16;
   }
+
+#ifdef _WIN32
+  // Windows path: defer to the platform converter and copy through wchar_t,
+  // which is the same width as char16_t on this OS.
 
   // Extra parentheses needed here to prevent expanding max as a
   // Windows-specific preprocessor macro.
@@ -115,13 +120,7 @@ std::wstring Utf8ToUtf16(const char* utf8, size_t utf8Len)
   constexpr DWORD flags = MB_ERR_INVALID_CHARS;
 
   const int utf16Length = ::MultiByteToWideChar(
-    CP_UTF8,       // Source string is in UTF-8.
-    flags,         // Conversion flags.
-    utf8,          // Source UTF-8 string pointer.
-    utf8Length,    // Length of the source UTF-8 string, in chars.
-    nullptr,       // Do not convert during this step, instead
-    0              //   request size of destination buffer, in wchar_ts.
-  );
+    CP_UTF8, flags, utf8, utf8Length, nullptr, 0);
 
   if (utf16Length == 0)
   {
@@ -130,16 +129,10 @@ std::wstring Utf8ToUtf16(const char* utf8, size_t utf8Len)
 
   utf16.resize(utf16Length);
 
-  // Convert from UTF-8 to UTF-16
-  // Note that MultiByteToWideChar converts the UTF-8 BOM into the UTF-16BE BOM.
   int result = ::MultiByteToWideChar(
-    CP_UTF8,       // Source string is in UTF-8.
-    flags,         // Conversion flags.
-    utf8,          // Source UTF-8 string pointer.
-    utf8Length,    // Length of source UTF-8 string, in chars.
-    &utf16[0],     // Pointer to destination buffer.
-    utf16Length    // Size of destination buffer, in wchar_ts.
-  );
+    CP_UTF8, flags, utf8, utf8Length,
+    reinterpret_cast<wchar_t*>(&utf16[0]),
+    utf16Length);
 
   if (result == 0)
   {
@@ -147,6 +140,55 @@ std::wstring Utf8ToUtf16(const char* utf8, size_t utf8Len)
   }
 
   return utf16;
+#else
+  // POSIX path: hand-rolled UTF-8 decoder. wchar_t is 32-bit on POSIX, so we
+  // can't use MultiByteToWideChar's signature even with iconv; the simplest
+  // and dependency-free option is to decode the four UTF-8 forms directly and
+  // emit surrogate pairs for code points >= U+10000. Mirrors the validation
+  // semantics of MB_ERR_INVALID_CHARS: malformed input throws.
+  utf16.reserve(utf8Len);
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(utf8);
+  const unsigned char* end = p + utf8Len;
+
+  auto cont = [&](const unsigned char*& q) -> uint32_t {
+    if (q >= end || (*q & 0xC0) != 0x80) {
+      throw std::runtime_error("Invalid UTF-8 continuation byte while converting to UTF-16.");
+    }
+    return static_cast<uint32_t>(*q++ & 0x3F);
+  };
+
+  while (p < end) {
+    uint32_t cp;
+    unsigned char b = *p++;
+    if (b < 0x80) {
+      cp = b;
+    } else if ((b & 0xE0) == 0xC0) {
+      cp = (static_cast<uint32_t>(b & 0x1F) << 6) | cont(p);
+      if (cp < 0x80) throw std::runtime_error("Overlong UTF-8 sequence.");
+    } else if ((b & 0xF0) == 0xE0) {
+      uint32_t c1 = cont(p), c2 = cont(p);
+      cp = (static_cast<uint32_t>(b & 0x0F) << 12) | (c1 << 6) | c2;
+      if (cp < 0x800) throw std::runtime_error("Overlong UTF-8 sequence.");
+      if (cp >= 0xD800 && cp <= 0xDFFF) throw std::runtime_error("UTF-8 encodes a surrogate.");
+    } else if ((b & 0xF8) == 0xF0) {
+      uint32_t c1 = cont(p), c2 = cont(p), c3 = cont(p);
+      cp = (static_cast<uint32_t>(b & 0x07) << 18) | (c1 << 12) | (c2 << 6) | c3;
+      if (cp < 0x10000 || cp > 0x10FFFF) throw std::runtime_error("UTF-8 out of Unicode range.");
+    } else {
+      throw std::runtime_error("Invalid UTF-8 leading byte.");
+    }
+
+    if (cp < 0x10000) {
+      utf16.push_back(static_cast<char16_t>(cp));
+    } else {
+      cp -= 0x10000;
+      utf16.push_back(static_cast<char16_t>(0xD800 | (cp >> 10)));
+      utf16.push_back(static_cast<char16_t>(0xDC00 | (cp & 0x3FF)));
+    }
+  }
+
+  return utf16;
+#endif
 }
 
 char ToLower(char c) {

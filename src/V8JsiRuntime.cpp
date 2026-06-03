@@ -366,10 +366,14 @@ void V8Runtime::initializeV8() {
     if (args_.flags.lite_mode)
       argv.push_back("--lite_mode");
 
-    // Caller-supplied extra V8 command-line flags. The c_str() pointers stay valid as long as
-    // args_.extraV8Flags is not mutated, which is guaranteed for the duration of this lambda.
-    for (const std::string &flag : args_.extraV8Flags) {
-      argv.push_back(flag.c_str());
+    // Caller-supplied extra V8 command-line flags. Pointers are owned by the
+    // caller and must outlive makeV8Runtime(), per the public API contract.
+    if (args_.extraV8Flags != nullptr) {
+      for (std::size_t i = 0; i < args_.extraV8FlagCount; ++i) {
+        if (args_.extraV8Flags[i] != nullptr) {
+          argv.push_back(args_.extraV8Flags[i]);
+        }
+      }
     }
 
     int argc = static_cast<int>(argv.size());
@@ -378,11 +382,12 @@ void V8Runtime::initializeV8() {
 
   // If V8 was already initialized by an earlier makeV8Runtime call, any flags
   // in this call's extraV8Flags were silently dropped. Surface that explicitly.
-  if (!init_ran && !args_.extraV8Flags.empty()) {
+  if (!init_ran && args_.extraV8Flags != nullptr && args_.extraV8FlagCount > 0) {
+    const char *first = args_.extraV8Flags[0] != nullptr ? args_.extraV8Flags[0] : "";
     TRACEV8RUNTIME_WARNING(
         "extraV8Flags ignored: V8 platform was already initialized by an earlier makeV8Runtime call",
-        TraceLoggingInt32(static_cast<int32_t>(args_.extraV8Flags.size()), "ignored_flag_count"),
-        TraceLoggingString(args_.extraV8Flags.front().c_str(), "first_ignored_flag"));
+        TraceLoggingInt32(static_cast<int32_t>(args_.extraV8FlagCount), "ignored_flag_count"),
+        TraceLoggingString(first, "first_ignored_flag"));
   }
 }
 
@@ -418,7 +423,7 @@ V8Runtime::V8Runtime(V8RuntimeArgs &&args) : args_(std::move(args)) {
 
   v8::Context::Scope context_scope(context);
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
   void *inspector_agent = isolate_->GetData(ISOLATE_INSPECTOR_SLOT);
   if (inspector_agent) {
     inspector_agent_ = reinterpret_cast<inspector::Agent *>(inspector_agent)->getShared();
@@ -428,7 +433,9 @@ V8Runtime::V8Runtime(V8RuntimeArgs &&args) : args_(std::move(args)) {
   }
 
   const char *context_name =
-      args_.debuggerRuntimeName.empty() ? "JSIRuntime context" : args_.debuggerRuntimeName.c_str();
+      (args_.debuggerRuntimeName == nullptr || args_.debuggerRuntimeName[0] == '\0')
+          ? "JSIRuntime context"
+          : args_.debuggerRuntimeName;
   inspector_agent_->addContext(GetContextLocal(), context_name);
 
   if (args_.flags.enableInspector) {
@@ -449,7 +456,7 @@ V8Runtime::~V8Runtime() {
   // TODO: add check that destruction happens on the same thread id as
   // construction
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
   {
     if (inspector_agent_) {
       IsolateLocker isolate_locker(this);
@@ -469,7 +476,7 @@ V8Runtime::~V8Runtime() {
 
   GetAndClearLastUnhandledPromiseRejection();
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
   if (inspector_agent_) {
     inspector_agent_.reset();
   }
@@ -2017,7 +2024,7 @@ V8JSI_EXPORT std::unique_ptr<jsi::Runtime> __cdecl makeV8Runtime(V8RuntimeArgs &
   return std::make_unique<V8Runtime>(std::move(args));
 }
 
-#if defined(_WIN32) && defined(V8JSI_ENABLE_INSPECTOR)
+#if defined(V8JSI_ENABLE_INSPECTOR)
 void openInspector(jsi::Runtime &runtime) {
   V8Runtime &v8Runtime = reinterpret_cast<V8Runtime &>(runtime);
   std::shared_ptr<inspector::Agent> inspector_agent = v8Runtime.getInspectorAgent();

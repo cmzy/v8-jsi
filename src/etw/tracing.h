@@ -57,7 +57,14 @@ void globalInitializeTracing();
 
 #define TRACEV8RUNTIME_VERBOSE(eventName, ...)
 #define TRACEV8RUNTIME_WARNING(eventName, ...)
+#define TRACEV8RUNTIME_ERROR(eventName, ...)
 #define TRACEV8RUNTIME_CRITICAL(eventName, ...)
+#define TRACEV8INSPECTOR_VERBOSE(eventName, ...)
+#define TRACEV8INSPECTOR_WARNING(eventName, ...)
+#define TRACEV8INSPECTOR_ERROR(eventName, ...)
+#define TRACEV8INSPECTOR_CRITICAL(eventName, ...)
 #define TraceLoggingString(foo,bar)
+#define TraceLoggingInt32(foo,bar)
+#define TraceLoggingBool(foo,bar)
 
 #endif
