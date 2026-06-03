@@ -86,6 +86,16 @@ def run(
     pretty = " ".join(str_cmd)
     print(f"+ {pretty}", flush=True)
 
+    # Windows compat: subprocess.run with a list does NOT search PATHEXT, so
+    # bare 'fetch' (no extension) does not find depot_tools' 'fetch.bat' even
+    # when depot_tools is on PATH -- yielding `FileNotFoundError [WinError 2]`.
+    # shutil.which DOES honor PATHEXT, so resolve the executable up front.
+    # Harmless on Unix (returns the same path that exec would have found).
+    import shutil as _shutil
+    resolved = _shutil.which(str_cmd[0])
+    if resolved is not None:
+        str_cmd[0] = resolved
+
     result = subprocess.run(
         str_cmd,
         cwd=str(cwd) if cwd is not None else None,
