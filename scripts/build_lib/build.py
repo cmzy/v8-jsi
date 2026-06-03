@@ -87,6 +87,17 @@ def _gn_arg_string(
     if not building_windows:
         flags.append("use_goma=false")
         flags.append(f'target_os="{app_platform}"')
+        if app_platform in ("mac", "ios"):
+            # Chromium's bundled libc++ on Apple builds a precompiled module
+            # for `DarwinFoundation1` and needs an SDK that ships
+            # `usr/include/DarwinFoundation1.modulemap`. Xcode 16.4 / macOS
+            # SDK 15.5 reorganized this path and the build aborts with
+            #   ninja: error: '.../DarwinFoundation1.modulemap', needed by
+            #          'obj/buildtools/third_party/libc++/_AvailabilityInternal/
+            #          DarwinFoundation1.pcm', missing and no known rule
+            # Falling back to the platform libc++ removes the dependency on
+            # Chromium's libc++ modulemap and uses Apple's system headers.
+            flags.append("use_custom_libcxx=false")
         if app_platform == "ios":
             # Chromium iOS requires explicit target_environment: device,
             # simulator, or catalyst. Default to device so the build

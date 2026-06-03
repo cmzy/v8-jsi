@@ -266,3 +266,14 @@ def fetch(
                 )
 
     _prune(work)
+
+    # V8 14 + is_official_build=true 触发某些 BUILD.gn / exec_script 读
+    # v8/chrome/VERSION（Chromium 主仓约定，V8 standalone gclient sync 不拉
+    # chrome/ 子树）。stub 一个最小 VERSION 让 gn gen 跳过；运行时不读。
+    chrome_version = v8 / "chrome" / "VERSION"
+    if not chrome_version.exists():
+        chrome_version.parent.mkdir(parents=True, exist_ok=True)
+        chrome_version.write_text("MAJOR=140\nMINOR=0\nBUILD=0\nPATCH=0\n",
+                                  encoding="utf-8")
+        print(f"Stubbed {chrome_version} (V8 standalone build needs MAJOR/.../PATCH).",
+              flush=True)
