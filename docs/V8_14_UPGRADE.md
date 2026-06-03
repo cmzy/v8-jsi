@@ -345,8 +345,17 @@ NDK ABI names that Gradle's `jniLibs.srcDirs` expects (`x86_64`, `x86`,
   need a rename step.
 
 The mapping table lives in `scripts/build_lib/build.py` as
-`_ANDROID_CPU_TO_ABI`; add an `"arm" -> "armeabi-v7a"` entry there if a
-32-bit Android target is ever introduced.
+`_ANDROID_CPU_TO_ABI`:
+
+| GN `target_cpu` | NDK ABI |
+|-----------------|---------|
+| `x64` | `x86_64` |
+| `x86` | `x86` |
+| `arm64` | `arm64-v8a` |
+| `arm` | `armeabi-v7a` |
+
+Each variant has to be built explicitly — `dev.py build --app-platform
+android --platform <cpu>` once per ABI you want to ship.
 
 ### iOS framework packaging
 

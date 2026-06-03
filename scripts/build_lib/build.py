@@ -218,8 +218,7 @@ _ANDROID_CPU_TO_ABI = {
     "x64": "x86_64",
     "x86": "x86",
     "arm64": "arm64-v8a",
-    # arm32 is not currently part of TARGET_CPUS; if it is added later
-    # the corresponding "arm" -> "armeabi-v7a" entry goes here.
+    "arm": "armeabi-v7a",
 }
 
 
@@ -335,7 +334,13 @@ def build(
     # that can run a native binary directly (win32 / linux / mac). Android
     # and iOS cross-compiles build only the shared library; testing those
     # happens on-device through the embedder app.
-    if app_platform in ("win32", "linux", "mac"):
+    #
+    # We also skip jsitests on Release builds because the Release config
+    # disables Node-API (`v8jsi_enable_node_api=false`) for size, while
+    # testmain.cpp unconditionally pulls in node-api-jsi headers. Tests
+    # therefore run against Debug builds (which keep N-API on).
+    is_release = "ebug" not in configuration
+    if app_platform in ("win32", "linux", "mac") and not is_release:
         ninja_targets.append("jsitests")
         if app_platform == "win32":
             # node_api_tests pulls in child_process.cpp which uses

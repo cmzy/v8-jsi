@@ -313,8 +313,17 @@ Inspector 代码目前只在 Windows 上真的接通了 —— `src/inspector/` 
   `jniLibs.srcDirs '...lib/android/<cfg>'` 用，AAR 流水线不再需要中间
   rename 脚本。
 
-映射表写在 `scripts/build_lib/build.py` 的 `_ANDROID_CPU_TO_ABI`；后续若
-要加 32 位 Android target，在那里补 `"arm" -> "armeabi-v7a"` 一条即可。
+映射表写在 `scripts/build_lib/build.py` 的 `_ANDROID_CPU_TO_ABI`：
+
+| GN `target_cpu` | NDK ABI |
+|-----------------|---------|
+| `x64` | `x86_64` |
+| `x86` | `x86` |
+| `arm64` | `arm64-v8a` |
+| `arm` | `armeabi-v7a` |
+
+每个变体都要单独构建 —— `dev.py build --app-platform android --platform <cpu>`
+对每个要发布的 ABI 跑一次。
 
 ### iOS framework 打包
 
