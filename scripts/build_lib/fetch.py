@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 from pathlib import Path
 
@@ -24,7 +25,11 @@ _PRUNE_PATHS = (
     "v8/test/test262/data/tools",
     "v8/third_party/depot_tools/external_bin/gsutil",
     "v8/third_party/perfetto",
-    "v8/third_party/protobuf",
+    # NOTE: v8/third_party/protobuf is intentionally NOT pruned --
+    # V8 14.x fuzztest references "$protobuf_target_prefix:protobuf_lite"
+    # from its BUILD.gn during `gn gen`, even with v8_enable_test_features
+    # off, so deleting it makes gn fail before ninja can run. Inherited
+    # from the V8 13 PowerShell scripts where protobuf was unused.
     "v8/third_party/rust",
     # NOTE: v8/third_party/rust-toolchain is intentionally NOT pruned —
     # build/config/rust.gni reads its VERSION file unconditionally during
@@ -130,6 +135,21 @@ def _our_git_hash(sources_path: Path) -> str:
         return "unknown"
 
 
+def _prune_on_rm_error(func, path, exc_info):
+    """shutil.rmtree onerror handler: clear the read-only bit and retry.
+
+    Windows depot_tools leaves git pack files (``*.idx``, ``*.pack``) inside
+    third_party/perfetto/.git/objects/pack with the read-only attribute set,
+    which makes the default ``os.unlink`` raise ``PermissionError: [WinError
+    5] Access is denied``. Clearing read-only and retrying is the standard
+    Python idiom (see CPython issue #26660)."""
+    try:
+        os.chmod(path, stat.S_IWRITE)
+    except OSError:
+        pass
+    func(path)
+
+
 def _prune(work: Path) -> None:
     for rel in _PRUNE_PATHS:
         target = work / rel
@@ -137,9 +157,12 @@ def _prune(work: Path) -> None:
             continue
         print(f"Pruning {target}", flush=True)
         if target.is_dir():
-            shutil.rmtree(target)
+            shutil.rmtree(target, onerror=_prune_on_rm_error)
         else:
-            target.unlink()
+            try:
+                target.unlink()
+            except PermissionError:
+                _prune_on_rm_error(os.unlink, str(target), None)
 
 
 def fetch(

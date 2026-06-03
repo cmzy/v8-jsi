@@ -100,6 +100,12 @@ def _gn_arg_string(
             # being part of the first generation step. Disable
             # WebAssembly explicitly here.
             flags.append("v8_enable_webassembly=false")
+            # Headless CI runners have no Apple developer identity in the
+            # keychain, so //build/config/apple/mobile_config.gni's call
+            # to find_signing_identity.py fails at `gn gen` time. We only
+            # produce static libraries that the embedder re-signs anyway,
+            # so disable Chromium's signing step here.
+            flags.append("ios_enable_code_signing=false")
     else:
         if not use_libcpp:
             flags.append("use_custom_libcxx=false")
