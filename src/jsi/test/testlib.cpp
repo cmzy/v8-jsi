@@ -411,11 +411,16 @@ TEST_P(JSITest, HostObjectTest) {
 
   class ThrowingHostObject : public HostObject {
     Value get(Runtime& rt, const PropNameID& sym) override {
-      throw std::runtime_error("Cannot get");
+      // v8-jsi convention: HostObject callbacks must throw jsi::JSError
+      // (or one of its subclasses); raw std::exception subclasses cannot
+      // cross the libv8jsi.so boundary because libcxx is statically
+      // linked into both libv8jsi.so and the consumer, so their typeinfo
+      // addresses diverge under the Itanium "Unique" implementation.
+      throw JSINativeException("Cannot get");
     }
 
     void set(Runtime& rt, const PropNameID& sym, const Value& val) override {
-      throw std::runtime_error("Cannot set");
+      throw JSINativeException("Cannot set");
     }
   };
 
@@ -762,7 +767,13 @@ TEST_P(JSITest, HostFunctionTest) {
             Value::strictEquals(rt, thisVal, rt.global()) ||
             thisVal.isUndefined());
         if (count != 2) {
-          throw std::runtime_error("expected 2 args");
+          // See ThrowingHostObject above: HostFunction implementations must
+          // throw jsi::JSError or jsi::JSINativeException so that
+          // HostFunctionProxy::call's catch (jsi::JSIException&) handler
+          // converts them into a JS Error with a real message. Raw
+          // std::exception subclasses would have private typeinfo across
+          // libv8jsi.so and fall through to catch (...) instead.
+          throw JSINativeException("expected 2 args");
         }
         std::string ret = args[0].getString(rt).utf8(rt) + "." +
             args[1].getString(rt).utf8(rt);

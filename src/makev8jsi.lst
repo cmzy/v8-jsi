@@ -1,6 +1,42 @@
+/*
+ * Linker version script for libv8jsi.so.
+ *
+ * Historically this script only exposed the single makeV8Runtime symbol.
+ * That works when the consumer only calls that function and treats
+ * jsi::Runtime as opaque, but it breaks `catch (const jsi::JSError&)`:
+ * RTTI matches on the *address* of the typeinfo object, not the mangled
+ * name, so the typeinfo for JSError must be visible from libv8jsi.so's
+ * dynsym for consumer-side catch clauses to bind.
+ *
+ * std:: typeinfo is provided by the host's libstdc++.so (we build with
+ * use_custom_libcxx=false), so it does not need to be re-exported here.
+ *
+ * Everything else stays local — V8's internals would add hundreds of MB
+ * to the dynamic symbol table otherwise.
+ */
 {
   global:
+    /* makeV8Runtime(V8RuntimeArgs&&) */
     _ZN9v8runtime13makeV8RuntimeEONS_13V8RuntimeArgsE;
+
+    /* facebook::jsi::*  -- members, static members, typeinfo, vtable. */
+    _ZN8facebook3jsi*;
+    _ZNK8facebook3jsi*;
+    _ZTIN8facebook3jsi*;
+    _ZTSN8facebook3jsi*;
+    _ZTVN8facebook3jsi*;
+
+    /* v8runtime::IStructuredClone / IHostObjectCodec — interfaces reached
+     * through jsi::castInterface. */
+    _ZN9v8runtime16IStructuredClone*;
+    _ZN9v8runtime16IHostObjectCodec*;
+    _ZNK9v8runtime16IStructuredClone*;
+    _ZNK9v8runtime16IHostObjectCodec*;
+    _ZTIN9v8runtime16IStructuredCloneE;
+    _ZTIN9v8runtime16IHostObjectCodecE;
+    _ZTVN9v8runtime16IStructuredCloneE;
+    _ZTVN9v8runtime16IHostObjectCodecE;
+
   local:
     *;
 };

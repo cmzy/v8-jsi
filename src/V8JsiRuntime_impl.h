@@ -8,7 +8,7 @@
 // embedder. We replicate the same set used by NodeApiJsiRuntime.cpp so that
 // override signatures using these markers match jsi.h's base declarations.
 #ifndef JSI_VERSION
-#define JSI_VERSION 19
+#define JSI_VERSION 20
 #endif
 #ifndef JSI_NO_CONST_3
 #if JSI_VERSION >= 3
@@ -325,10 +325,15 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
         // Schedule to throw the exception back to JS.
         info.GetIsolate()->ThrowException(runtime.valueReference(error.value()));
         return v8::Intercepted::kYes;
-      } catch (const std::exception &ex) {
+      } catch (const facebook::jsi::JSIException &ex) {
+        // facebook::jsi::* typeinfo is exported from libv8jsi.so (see
+        // makev8jsi.lst), so this catch matches across the .so boundary
+        // even though libcxx is statically linked. Embedders that want a
+        // meaningful host-callback error message must throw a jsi::*
+        // exception (JSError or JSINativeException), not a raw
+        // std::runtime_error/logic_error — those have private typeinfo
+        // in each .so and would silently fall through to catch (...).
         info.GetReturnValue().Set(v8::Undefined(info.GetIsolate()));
-
-        // Schedule to throw the exception back to JS.
         v8::Local<v8::String> message =
             v8::String::NewFromUtf8(info.GetIsolate(), ex.what(), v8::NewStringType::kNormal).ToLocalChecked();
         info.GetIsolate()->ThrowException(v8::Exception::Error(message));
@@ -365,8 +370,9 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
       } catch (const facebook::jsi::JSError &error) {
         // Schedule to throw the exception back to JS.
         info.GetIsolate()->ThrowException(runtime.valueReference(error.value()));
-      } catch (const std::exception &ex) {
-        // Schedule to throw the exception back to JS.
+      } catch (const facebook::jsi::JSIException &ex) {
+        // See GetInternal: catch the jsi:: hierarchy (typeinfo exported)
+        // rather than std::exception (typeinfo private to each .so).
         v8::Local<v8::String> message =
             v8::String::NewFromUtf8(info.GetIsolate(), ex.what(), v8::NewStringType::kNormal).ToLocalChecked();
         info.GetIsolate()->ThrowException(v8::Exception::Error(message));
@@ -531,10 +537,15 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
         // Schedule to throw the exception back to JS
         isolate->ThrowException(runtime.valueReference(error.value()));
         return;
-      } catch (const std::exception &ex) {
+      } catch (const facebook::jsi::JSIException &ex) {
+        // See HostObjectProxy: jsi::* typeinfo is exported from
+        // libv8jsi.so, so a HostFunction implementation that throws
+        // jsi::JSError / jsi::JSINativeException is caught here.
+        // std::exception subclasses must NOT be thrown from host
+        // callbacks: their typeinfo is private per .so and would fall
+        // through to catch (...) with a generic message.
         callbackInfo.GetReturnValue().Set(v8::Undefined(isolate));
 
-        // Schedule to throw the exception back to JS
         std::string errMessage = std::string("Exception in HostFunction: ") + ex.what();
         v8::Local<v8::String> message =
             v8::String::NewFromUtf8(isolate, errMessage.c_str(), v8::NewStringType::kNormal).ToLocalChecked();
@@ -570,6 +581,10 @@ class V8Runtime : public facebook::jsi::Runtime, public v8runtime::IStructuredCl
 
     HostFunctionProxy(V8Runtime &runtime, facebook::jsi::HostFunctionType func)
         : func_(std::move(func)), runtime_(runtime) {}
+
+    facebook::jsi::HostFunctionType &getHostFunction() {
+      return func_;
+    }
 
    private:
     friend class HostObjectLifetimeTracker;

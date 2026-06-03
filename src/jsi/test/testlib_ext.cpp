@@ -549,7 +549,11 @@ TEST_P(JSITestExt, NativeExceptionDoesNotUseGlobalError) {
       PropNameID::forAscii(rt, "alwaysThrows"),
       0,
       [](Runtime&, const Value&, const Value*, size_t) -> Value {
-        throw std::logic_error(
+        // v8-jsi convention: throw a jsi::* exception (here
+        // JSINativeException so the test's "Error has been clobbered to
+        // 10" precondition is preserved — JSError would try to use the
+        // global Error and the message would round-trip oddly).
+        throw JSINativeException(
             "Native std::logic_error C++ exception in Host Function");
       });
   rt.global().setProperty(rt, "alwaysThrows", alwaysThrows);

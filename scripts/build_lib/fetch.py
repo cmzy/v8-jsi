@@ -26,7 +26,10 @@ _PRUNE_PATHS = (
     "v8/third_party/perfetto",
     "v8/third_party/protobuf",
     "v8/third_party/rust",
-    "v8/third_party/rust-toolchain",
+    # NOTE: v8/third_party/rust-toolchain is intentionally NOT pruned —
+    # build/config/rust.gni reads its VERSION file unconditionally during
+    # `gn gen`, even when enable_rust=false / v8_enable_temporal_support=
+    # false. Removing it makes Mac gn gen fail with a missing-file error.
     "v8/bazel",
     "v8/tools/clusterfuzz",
     "v8/tools/package-lock.json",
@@ -174,8 +177,19 @@ def fetch(
     env.run(["git", "fetch", "origin", v8ref], cwd=v8)
     env.run(["git", "checkout", "FETCH_HEAD"], cwd=v8)
 
-    # Step 4: apply the in-tree patches (skip when bringing up a new V8
-    # version; patches can be re-applied or refreshed afterwards).
+    # Step 4: gclient sync refuses to operate on dirty sub-repos. If a
+    # previous fetch left patches applied to v8/build or third_party/zlib
+    # (typical when calling fetch a second time to add another target_os),
+    # roll them back so sync can run. We re-apply the patches at the end.
+    for sub in (v8 / "build", v8 / "third_party" / "zlib"):
+        if (sub / ".git").exists():
+            try:
+                env.run(["git", "reset", "--hard", "HEAD"], cwd=sub, check=False)
+            except Exception:
+                pass
+
+    # Apply the v8/ patches (src.diff). This must happen BEFORE gclient
+    # runhooks because src.diff edits DEPS (the rc_win hook).
     patch_dir = sources_path / "scripts" / "patch"
     if not skip_patches:
         _apply_patch(v8, patch_dir / "src.diff")
@@ -207,19 +221,25 @@ def fetch(
                     f"##vso[build.updateBuildNumber]{new_build_number}"
                 )
 
-    # Step 6: install distro deps for the Linux/Android cross-compiles. We
-    # only call sudo when running on Linux; on Mac/Windows the script is a
-    # no-op even if the caller asked for an Android build (depot_tools
-    # already vendors the Android NDK in that case).
-    if env.is_linux() and app_platform == "android":
-        env.run(
-            ["sudo", "bash", str(v8 / "build" / "install-build-deps-android.sh")],
-            cwd=v8,
-        )
-    if env.is_linux() and app_platform == "linux":
-        env.run(
-            ["sudo", "bash", str(v8 / "build" / "install-build-deps.sh")],
-            cwd=v8,
-        )
+    # Step 6: install distro deps for the Linux/Android cross-compiles.
+    # Uses `sudo -n` so non-interactive runs (CI, ssh w/o tty) skip the
+    # apt-get step and continue instead of blocking on a password prompt.
+    # Run `sudo -v` once beforehand to cache credentials if you want the
+    # deps actually installed.
+    if env.is_linux() and app_platform in ("android", "linux"):
+        script = "install-build-deps-android.sh" if app_platform == "android" \
+                 else "install-build-deps.sh"
+        deps_script = v8 / "build" / script
+        if deps_script.exists():
+            try:
+                env.run(["sudo", "-n", "bash", str(deps_script)], cwd=v8)
+            except SystemExit:
+                print(
+                    f"NOTE: skipped `sudo bash {deps_script.name}` (no passwordless "
+                    "sudo available). If the build later complains about missing "
+                    "system libraries (especially for Android cross-compile), run "
+                    "the script manually as root and re-trigger the build.",
+                    flush=True,
+                )
 
     _prune(work)

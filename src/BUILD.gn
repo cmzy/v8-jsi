@@ -105,9 +105,19 @@ target("shared_library", "v8jsi") {
         "/SOURCELINK:" + rebase_path("//jsi/source_link_gen.json"),
       ]
     }
-  } else if (!is_mac) {
+  } else if (!is_mac && !is_ios) {
     ldflags = [ "-Wl,--allow-multiple-definition" ]
     ldflags += [ "-Wl,--version-script=" + rebase_path("//jsi/makev8jsi.lst") ]
+  } else {
+    # On macOS/iOS jsitests has its own copy of jsi.cpp (JSIException
+    # lives there). With the default two-level namespace each side owns
+    # a separate typeinfo address, so `catch (jsi::JSIException&)`
+    # inside this dylib does not match an exception thrown from the
+    # executable's own code (Itanium catch matching is pointer-, not
+    # name-based). Flat-namespace dyld resolution at load time
+    # coalesces the typeinfo symbols by name — same effect as the
+    # Linux flat namespace + --version-script combination.
+    ldflags = [ "-Wl,-flat_namespace" ]
   }
 
   include_dirs = [
@@ -223,6 +233,19 @@ target("executable", "jsitests") {
     sources += [ "jsi/jsilib-windows.cpp" ]
   } else {
     sources += [ "jsi/jsilib-posix.cpp" ]
+  }
+
+  if (is_mac || is_ios) {
+    # jsitests compiles its own copy of jsi.cpp (the JSIException /
+    # JSINativeException class definitions live there), and libv8jsi.dylib
+    # has another copy. Under the default two-level namespace, each copy
+    # owns a separate typeinfo address, so a `catch (jsi::JSIException&)`
+    # inside the dylib does not match an exception thrown from jsitests's
+    # own code (Itanium catch matching is pointer-, not name-based).
+    # `-flat_namespace` makes the dyld resolve symbols by name across all
+    # loaded images — like Linux — so the dylib's exported typeinfo wins
+    # for both sides and cross-DSO catches work.
+    ldflags = [ "-Wl,-flat_namespace" ]
   }
 
   if (v8jsi_enable_node_api) {

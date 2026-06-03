@@ -12,7 +12,7 @@ from typing import Iterable, Mapping
 
 
 # Recognized AppPlatform values, mirroring the PowerShell scripts.
-APP_PLATFORMS = ("win32", "android", "linux", "mac")
+APP_PLATFORMS = ("win32", "android", "linux", "mac", "ios")
 TARGET_CPUS = ("x64", "x86", "arm64")
 CONFIGURATIONS = ("Debug", "Release")
 

@@ -38,45 +38,12 @@ struct ContextEmbedderIndex {
 /*static*/ bool V8PlatformHolder::is_disposed_s_{false};
 
 // String utilities
-//
-// Manual UTF-16 → UTF-8 to sidestep V8 14.8 WriteUtf8V2 for now (the test
-// suite reproduces a destructor-time free() crash with `0xNNNN0002d320`-
-// looking addresses when we route stack/message reads through WriteUtf8V2).
-// Going through WriteV2 + a hand-rolled encoder isolates the conversion to
-// libc-owned memory and lets us prove the failure mode.
 std::string JSStringToSTLString(v8::Isolate *isolate, v8::Local<v8::String> string) {
-  uint32_t utf16Len = static_cast<uint32_t>(string->Length());
-  if (utf16Len == 0) return {};
-  std::u16string utf16(utf16Len, u'\0');
-  string->WriteV2(isolate, 0, utf16Len, reinterpret_cast<uint16_t *>(utf16.data()));
-  std::string out;
-  out.reserve(utf16Len);
-  for (uint32_t i = 0; i < utf16Len; ++i) {
-    uint32_t cp = utf16[i];
-    if (cp >= 0xD800 && cp <= 0xDBFF && i + 1 < utf16Len) {
-      uint32_t low = utf16[i + 1];
-      if (low >= 0xDC00 && low <= 0xDFFF) {
-        cp = 0x10000 + ((cp - 0xD800) << 10) + (low - 0xDC00);
-        ++i;
-      }
-    }
-    if (cp < 0x80) {
-      out.push_back(static_cast<char>(cp));
-    } else if (cp < 0x800) {
-      out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else if (cp < 0x10000) {
-      out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    } else {
-      out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
-    }
-  }
-  return out;
+  size_t utfLen = string->Utf8LengthV2(isolate);
+  std::string result;
+  result.resize(utfLen);
+  string->WriteUtf8V2(isolate, result.data(), utfLen);
+  return result;
 }
 
 std::u16string JSStringToStlU16String(v8::Isolate *isolate, v8::Local<v8::String> string) {
@@ -117,7 +84,7 @@ void V8Runtime::AddHostObjectLifetimeTracker(std::shared_ptr<HostObjectLifetimeT
       "V8::MessageFrom",
       TraceLoggingString(*msg, "message"),
       TraceLoggingString(*source_line, "source_line"),
-      TraceLoggingInt32(message->GetLineNumber(isolate->GetCurrentContext()).ToChecked(), "Line"),
+      TraceLoggingInt32(message->GetLineNumber(isolate->GetCurrentContext()).FromMaybe(0), "Line"),
       TraceLoggingInt32(message->GetStartPosition(), "StartPos"),
       TraceLoggingInt32(message->GetEndPosition(), "EndPos"),
       TraceLoggingInt32(message->ErrorLevel(), "ErrorLevel"),
@@ -877,11 +844,28 @@ facebook::jsi::Value V8Runtime::evaluatePreparedJavaScript(
 
 void V8Runtime::ReportException(v8::TryCatch *try_catch) {
   IsolateLocker isolate_locker(this);
+
+  v8::Local<v8::Value> v8exception = try_catch->Exception();
+
+  // JS can throw any value, not just Error: `throw 72`, `throw {...}`, etc.
+  // For non-Error, non-String throws, route the original Value through the
+  // JSError(Value&&) constructor so embedder code that does
+  // `catch (const JSError& e) { e.value().getNumber() == 72 }` recovers the
+  // original throwable instead of receiving a freshly-constructed Error
+  // built from a stringified copy. Error and String are left to the
+  // string-formatted path below so that JSError::what() keeps its existing
+  // human-readable behaviour.
+  if (!v8exception.IsEmpty()
+      && !v8exception->IsNativeError()
+      && !v8exception->IsString()) {
+    throw jsi::JSError(*this, createValue(v8exception));
+  }
+
   v8::Local<v8::Message> message = try_catch->Message();
   if (message.IsEmpty()) {
     // V8 didn't provide any extra information about this error; just
     // throw the exception.
-    v8::String::Utf8Value exception(GetIsolate(), try_catch->Exception());
+    v8::String::Utf8Value exception(GetIsolate(), v8exception);
     throw jsi::JSError(*this, ToCString(exception));
   } else {
     std::stringstream sstr;
@@ -1156,32 +1140,58 @@ std::shared_ptr<jsi::HostObject> V8Runtime::getHostObject(const jsi::Object &obj
   return hostObjectProxy->getHostObject();
 }
 
+// V8 14 changed ToLocalChecked() / FromJust() to FATAL-abort the process on
+// an empty MaybeLocal / Maybe (V8 12 returned an empty handle). Property
+// accessors that throw from JS (the JSI getter-throw, badObjKey-toString
+// and "throw 72" tests in testlib) reach exactly this case, so we wrap
+// every embedder-callable V8 property access with TryCatch + ReportException
+// so the V8 exception turns into a jsi::JSError instead of taking down the
+// whole process.
 jsi::Value V8Runtime::getProperty(const jsi::Object &obj, const jsi::String &name) {
   IsolateLocker isolate_locker(this);
-  return createValue(objectRef(obj)->Get(GetContextLocal(), stringRef(name)).ToLocalChecked());
+  v8::TryCatch tc(GetIsolate());
+  v8::MaybeLocal<v8::Value> result = objectRef(obj)->Get(GetContextLocal(), stringRef(name));
+  if (result.IsEmpty()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
+    throw jsi::JSError(*this, "V8Runtime::getProperty failed.");
+  }
+  return createValue(result.ToLocalChecked());
 }
 
 jsi::Value V8Runtime::getProperty(const jsi::Object &obj, const jsi::PropNameID &name) {
   IsolateLocker isolate_locker(this);
+  v8::TryCatch tc(GetIsolate());
   v8::MaybeLocal<v8::Value> result = objectRef(obj)->Get(GetContextLocal(), valueRef(name));
-  if (result.IsEmpty())
+  if (result.IsEmpty()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
     throw jsi::JSError(*this, "V8Runtime::getProperty failed.");
+  }
   return createValue(result.ToLocalChecked());
 }
 
 bool V8Runtime::hasProperty(const jsi::Object &obj, const jsi::String &name) {
   IsolateLocker isolate_locker(this);
+  v8::TryCatch tc(GetIsolate());
   v8::Maybe<bool> result = objectRef(obj)->Has(GetContextLocal(), stringRef(name));
-  if (result.IsNothing())
+  if (result.IsNothing()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
     throw jsi::JSError(*this, "V8Runtime::hasPropertyValue failed.");
+  }
   return result.FromJust();
 }
 
 bool V8Runtime::hasProperty(const jsi::Object &obj, const jsi::PropNameID &name) {
   IsolateLocker isolate_locker(this);
+  v8::TryCatch tc(GetIsolate());
   v8::Maybe<bool> result = objectRef(obj)->Has(GetContextLocal(), valueRef(name));
-  if (result.IsNothing())
+  if (result.IsNothing()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
     throw jsi::JSError(*this, "V8Runtime::hasPropertyValue failed.");
+  }
   return result.FromJust();
 }
 
@@ -1190,16 +1200,24 @@ void V8Runtime::setPropertyValue(
     const jsi::PropNameID &name,
     const jsi::Value &value) {
   IsolateLocker isolate_locker(this);
+  v8::TryCatch tc(GetIsolate());
   v8::Maybe<bool> result = objectRef(object)->Set(GetContextLocal(), valueRef(name), valueReference(value));
-  if (!result.FromMaybe(false))
+  if (result.IsNothing()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
     throw jsi::JSError(*this, "V8Runtime::setPropertyValue failed.");
+  }
 }
 
 void V8Runtime::setPropertyValue(JSI_CONST_10 jsi::Object &object, const jsi::String &name, const jsi::Value &value) {
   IsolateLocker isolate_locker(this);
+  v8::TryCatch tc(GetIsolate());
   v8::Maybe<bool> result = objectRef(object)->Set(GetContextLocal(), stringRef(name), valueReference(value));
-  if (!result.FromMaybe(false))
+  if (result.IsNothing()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
     throw jsi::JSError(*this, "V8Runtime::setPropertyValue failed.");
+  }
 }
 
 bool V8Runtime::isArray(const jsi::Object &obj) const {
@@ -1294,21 +1312,61 @@ jsi::Array V8Runtime::createArray(size_t length) {
 
 size_t V8Runtime::size(const jsi::Array &arr) {
   IsolateLocker isolate_locker(this);
-  v8::Local<v8::Array> array = v8::Local<v8::Array>::Cast(objectRef(arr));
-  return array->Length();
+  v8::Local<v8::Object> obj = objectRef(arr);
+  // v8::Array::Length() reads the internal array length slot, which Proxy
+  // objects don't have — it would return 0 for any Proxy-of-Array. Fall back
+  // to the `length` property so Proxy traps and exotic length getters work.
+  if (obj->IsProxy()) {
+    v8::TryCatch tc(GetIsolate());
+    auto context = GetContextLocal();
+    v8::Local<v8::Value> len;
+    if (!obj->Get(context, v8::String::NewFromUtf8Literal(GetIsolate(), "length"))
+             .ToLocal(&len)) {
+      if (tc.HasCaught())
+        ReportException(&tc);
+      throw jsi::JSError(*this, "V8Runtime::size failed.");
+    }
+    return len->Uint32Value(context).FromMaybe(0);
+  }
+  return v8::Local<v8::Array>::Cast(obj)->Length();
 }
 
 jsi::Value V8Runtime::getValueAtIndex(const jsi::Array &arr, size_t i) {
   IsolateLocker isolate_locker(this);
   v8::Local<v8::Array> array = v8::Local<v8::Array>::Cast(objectRef(arr));
-  return createValue(array->Get(GetContextLocal(), static_cast<uint32_t>(i)).ToLocalChecked());
+  v8::TryCatch tc(GetIsolate());
+  v8::MaybeLocal<v8::Value> result = array->Get(GetContextLocal(), static_cast<uint32_t>(i));
+  if (result.IsEmpty()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
+    throw jsi::JSError(*this, "V8Runtime::getValueAtIndex failed.");
+  }
+  return createValue(result.ToLocalChecked());
 }
 
 void V8Runtime::setValueAtIndexImpl(JSI_CONST_10 jsi::Array &arr, size_t i, const jsi::Value &value) {
   IsolateLocker isolate_locker(this);
   v8::Local<v8::Array> array = v8::Local<v8::Array>::Cast(objectRef(arr));
-  array->Set(GetContextLocal(), static_cast<uint32_t>(i), valueReference(value));
+  v8::TryCatch tc(GetIsolate());
+  v8::Maybe<bool> ok = array->Set(GetContextLocal(), static_cast<uint32_t>(i), valueReference(value));
+  if (ok.IsNothing() || tc.HasCaught()) {
+    if (tc.HasCaught())
+      ReportException(&tc);
+    throw jsi::JSError(*this, "V8Runtime::setValueAtIndexImpl failed.");
+  }
 }
+
+namespace {
+// Private symbol attached to v8::Function objects created via
+// createFunctionFromHostFunction. The associated value is a v8::External
+// wrapping the owning HostFunctionProxy*, which lets isHostFunction /
+// getHostFunction recover the proxy without scanning a side list.
+v8::Local<v8::Private> hostFunctionPrivateKey(v8::Isolate *isolate) {
+  v8::Local<v8::String> name =
+      v8::String::NewFromUtf8Literal(isolate, "$v8jsi$HostFunctionProxy");
+  return v8::Private::ForApi(isolate, name);
+}
+} // namespace
 
 jsi::Function V8Runtime::createFunctionFromHostFunction(
     const jsi::PropNameID &name,
@@ -1318,11 +1376,14 @@ jsi::Function V8Runtime::createFunctionFromHostFunction(
 
   HostFunctionProxy *hostFunctionProxy = new HostFunctionProxy(*this, func);
 
+  v8::Local<v8::External> external =
+      v8::External::New(GetIsolate(), hostFunctionProxy, v8::kExternalPointerTypeTagDefault);
+
   v8::Local<v8::Function> newFunction;
   if (!v8::Function::New(
            GetContextLocal(),
            HostFunctionProxy::HostFunctionCallback,
-           v8::Local<v8::External>::New(GetIsolate(), v8::External::New(GetIsolate(), hostFunctionProxy, v8::kExternalPointerTypeTagDefault)),
+           external,
            paramCount)
            .ToLocal(&newFunction)) {
     throw jsi::JSError(*this, "Creation of HostFunction failed.");
@@ -1330,18 +1391,39 @@ jsi::Function V8Runtime::createFunctionFromHostFunction(
 
   newFunction->SetName(v8::Local<v8::String>::Cast(valueRef(name)));
 
+  // Mark the function so isHostFunction / getHostFunction can recognize it
+  // and recover the proxy.
+  newFunction
+      ->SetPrivate(GetContextLocal(), hostFunctionPrivateKey(GetIsolate()), external)
+      .Check();
+
   AddHostObjectLifetimeTracker(std::make_shared<HostObjectLifetimeTracker>(*this, newFunction, hostFunctionProxy));
 
   return make<jsi::Object>(V8ObjectValue::make(GetIsolate(), newFunction)).getFunction(*this);
 }
 
 bool V8Runtime::isHostFunction(const jsi::Function &obj) const {
-  std::abort();
-  return false;
+  IsolateLocker isolate_locker(this);
+  v8::Local<v8::Object> fn = objectRef(obj);
+  if (!fn->IsFunction()) {
+    return false;
+  }
+  return fn->HasPrivate(GetContextLocal(), hostFunctionPrivateKey(GetIsolate()))
+      .FromMaybe(false);
 }
 
 jsi::HostFunctionType &V8Runtime::getHostFunction(const jsi::Function &obj) {
-  std::abort();
+  IsolateLocker isolate_locker(this);
+  v8::Local<v8::Object> fn = objectRef(obj);
+  v8::Local<v8::Value> marker;
+  if (!fn->GetPrivate(GetContextLocal(), hostFunctionPrivateKey(GetIsolate()))
+           .ToLocal(&marker) ||
+      !marker->IsExternal()) {
+    throw jsi::JSError(*this, "V8Runtime::getHostFunction: not a host function");
+  }
+  auto *proxy = static_cast<HostFunctionProxy *>(
+      marker.As<v8::External>()->Value(v8::kExternalPointerTypeTagDefault));
+  return proxy->getHostFunction();
 }
 
 #if JSI_VERSION >= 18

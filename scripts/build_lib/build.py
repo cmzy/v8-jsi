@@ -53,6 +53,19 @@ def _gn_arg_string(
     if not building_windows:
         flags.append("use_goma=false")
         flags.append(f'target_os="{app_platform}"')
+        if app_platform == "ios":
+            # Chromium iOS requires explicit target_environment: device,
+            # simulator, or catalyst. Default to device so the build
+            # produces an arm64 artifact suitable for installing on a
+            # real device or shipping in an embedder framework.
+            flags.append('target_environment="device"')
+            # iOS forbids JIT (App Store rules) and Apple lockdown mode,
+            # so V8 is built jitless and WebAssembly must be disabled —
+            # otherwise Torque references WasmFuncRef when generating the
+            # builtin tables without the corresponding wasm .tq files
+            # being part of the first generation step. Disable
+            # WebAssembly explicitly here.
+            flags.append("v8_enable_webassembly=false")
     else:
         if not use_libcpp:
             flags.append("use_custom_libcxx=false")
@@ -97,7 +110,13 @@ def _copy_jsi_tree(sources_path: Path, dest: Path) -> None:
 
 def _validate_build_output(out_dir: Path) -> Path:
     """Return whichever of v8jsi.{dll,so,dylib} is present."""
-    for name in ("v8jsi.dll", "libv8jsi.so", "libv8jsi.dylib"):
+    # iOS framework builds may nest the binary under libv8jsi.framework/.
+    for name in (
+        "v8jsi.dll",
+        "libv8jsi.so",
+        "libv8jsi.dylib",
+        "libv8jsi.framework/libv8jsi",
+    ):
         candidate = out_dir / name
         if candidate.exists():
             return candidate
@@ -144,7 +163,11 @@ def build(
     jobs = env.cpu_count_for_build()
 
     ninja_targets = ["v8jsi"]
-    if app_platform != "android":
+    # jsitests is a host gtest executable: it makes sense only on platforms
+    # that can run a native binary directly (win32 / linux / mac). Android
+    # and iOS cross-compiles build only the shared library; testing those
+    # happens on-device through the embedder app.
+    if app_platform in ("win32", "linux", "mac"):
         ninja_targets.append("jsitests")
         if app_platform == "win32":
             # node_api_tests pulls in child_process.cpp which uses
