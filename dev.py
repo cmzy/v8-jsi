@@ -77,18 +77,29 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     return 0
 
 
+_INSPECTOR_VARIANTS = {
+    "with": [True],
+    "without": [False],
+    "both": [True, False],
+}
+
+
 def cmd_build(args: argparse.Namespace) -> int:
     _depot.configure_env(args.sources)
-    _build.build(
-        args.sources,
-        platform_cpu=args.platform,
-        configuration=args.config,
-        app_platform=args.app_platform,
-        output_path=args.output,
-        use_clang=args.use_clang,
-        use_libcpp=args.use_libcpp,
-        fake_build=args.fake_build,
-    )
+    for enable_inspector in _INSPECTOR_VARIANTS[args.inspector]:
+        variant_label = "with-inspector" if enable_inspector else "noinspector"
+        print(f"Building variant: {variant_label}", flush=True)
+        _build.build(
+            args.sources,
+            platform_cpu=args.platform,
+            configuration=args.config,
+            app_platform=args.app_platform,
+            output_path=args.output,
+            use_clang=args.use_clang,
+            use_libcpp=args.use_libcpp,
+            fake_build=args.fake_build,
+            enable_inspector=enable_inspector,
+        )
     return 0
 
 
@@ -109,20 +120,25 @@ def cmd_all(args: argparse.Namespace) -> int:
     for plat in args.platform:
         for cfg in args.config:
             for app_plat in args.app_platform:
-                print(
-                    f"Building {app_plat} {plat} {cfg}...",
-                    flush=True,
-                )
-                _build.build(
-                    args.sources,
-                    platform_cpu=plat,
-                    configuration=cfg,
-                    app_platform=app_plat,
-                    output_path=args.output,
-                    use_clang=args.use_clang,
-                    use_libcpp=args.use_libcpp,
-                    fake_build=args.fake_build,
-                )
+                for enable_inspector in _INSPECTOR_VARIANTS[args.inspector]:
+                    variant_label = (
+                        "with-inspector" if enable_inspector else "noinspector"
+                    )
+                    print(
+                        f"Building {app_plat} {plat} {cfg} ({variant_label})...",
+                        flush=True,
+                    )
+                    _build.build(
+                        args.sources,
+                        platform_cpu=plat,
+                        configuration=cfg,
+                        app_platform=app_plat,
+                        output_path=args.output,
+                        use_clang=args.use_clang,
+                        use_libcpp=args.use_libcpp,
+                        fake_build=args.fake_build,
+                        enable_inspector=enable_inspector,
+                    )
     return 0
 
 
@@ -228,6 +244,16 @@ def _build_parser() -> argparse.ArgumentParser:
         "--fake-build", action="store_true",
         help="skip gn/ninja and produce placeholder outputs (CI smoke test)",
     )
+    p_build.add_argument(
+        "--inspector",
+        choices=("with", "without", "both"),
+        default="both",
+        help=(
+            "which inspector variant(s) to produce. "
+            "'with' / 'without' build one; 'both' builds both side-by-side. "
+            "Output filenames carry a '-noinspector' suffix for the slim build."
+        ),
+    )
     p_build.set_defaults(func=cmd_build)
 
     p_all = sub.add_parser("all", help="setup + fetch + build (localbuild.ps1)")
@@ -247,6 +273,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p_all.add_argument("--use-clang", action="store_true")
     p_all.add_argument("--use-libcpp", action="store_true")
     p_all.add_argument("--ado", action="store_true")
+    p_all.add_argument(
+        "--inspector",
+        choices=("with", "without", "both"),
+        default="both",
+        help="inspector variant(s) to build — see `build --help`.",
+    )
     p_all.set_defaults(func=cmd_all)
 
     p_uv = sub.add_parser(

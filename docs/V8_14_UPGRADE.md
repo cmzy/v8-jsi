@@ -299,6 +299,133 @@ Non-obvious things in the runner:
   - On Linux, when a second fetch adds another `target_os`, the sync
     needs to reset dirty sub-repos as described above.
 
+### Inspector variants
+
+Every `build` / `all` invocation produces both an inspector-enabled and an
+inspector-disabled binary by default (`--inspector both`; pass `with` /
+`without` to skip one).
+
+- Intermediate object dirs are separated per variant:
+  `build/v8/out/<app>/<cpu>/<cfg>/{with-inspector,noinspector}/`.
+- Packaged binaries land **side by side** in the same `lib_dir` (`out/lib/<app>/<cfg>/<cpu>/`).
+  Default-named artifact is the with-inspector build (backward-compatible);
+  the slim variant uses a `-noinspector` suffix.
+
+Per-platform packaged layout:
+
+| Platform | with-inspector | no-inspector | Notes |
+|----------|----------------|--------------|-------|
+| win32 | `v8jsi.dll` (+ `.dll.lib`, `.dll.pdb`) | `v8jsi-noinspector.dll` (+ `.dll.lib`, `.dll.pdb`) | Suffix applied to all three files. |
+| mac | `libv8jsi.dylib` | `libv8jsi-noinspector.dylib` | |
+| linux | `libv8jsi.so` | `libv8jsi-noinspector.so` | |
+| android | `libv8jsi.so` (+ JNI-ABI alias) | `libv8jsi-noinspector.so` (+ JNI-ABI alias) | See "Android JNI mirroring" below. |
+| ios | `libv8jsi.framework/` | `libv8jsi-noinspector.framework/` | Bundle dir + internal binary + `Info.plist::CFBundleExecutable` are all renamed together. |
+
+For each variant the corresponding `args.gn` is also dropped into `lib_dir`:
+`args.gn` (with-inspector) and `args-noinspector.gn`.
+
+Inspector code is presently only wired up on Windows — the sources under
+`src/inspector/` are gated on `is_win` in BUILD.gn and the call sites are
+gated on `_WIN32 && V8JSI_ENABLE_INSPECTOR`. On non-Windows platforms the
+two variants therefore produce binary-identical artifacts; we still ship
+both so the packaging pipeline and embedder-side naming convention stay
+uniform across platforms, and so a future POSIX inspector port slots in
+without rearranging the output tree.
+
+### Android JNI mirroring
+
+Our GN `target_cpu` names (`x64`, `x86`, `arm64`) don't match the Android
+NDK ABI names that Gradle's `jniLibs.srcDirs` expects (`x86_64`, `x86`,
+`arm64-v8a`). When `app_platform == "android"`, the packager writes the
+`.so` to **both** layouts:
+
+- `out/lib/android/<cfg>/<gn-cpu>/libv8jsi.so` — legacy / GN-style path.
+- `out/lib/android/<cfg>/<jni-abi>/libv8jsi.so` — drop-in for
+  `jniLibs.srcDirs '...lib/android/<cfg>'` so the .aar pipeline doesn't
+  need a rename step.
+
+The mapping table lives in `scripts/build_lib/build.py` as
+`_ANDROID_CPU_TO_ABI`; add an `"arm" -> "armeabi-v7a"` entry there if a
+32-bit Android target is ever introduced.
+
+### iOS framework packaging
+
+Unlike the other platforms, the iOS GN output is a directory bundle
+(`libv8jsi.framework/`) rather than a single file. The packager:
+
+1. Copies the bundle to `lib_dir/libv8jsi<suffix>.framework/`.
+2. Renames the internal binary so it matches the bundle name (Xcode
+   refuses to load a framework where the binary doesn't match).
+3. Patches `Info.plist::CFBundleExecutable` to the new name.
+
+Symlinks inside the framework are preserved.
+
+### Release-only size optimizations
+
+Layered on top of the V8 14 defaults; only kick in when `is_debug=false`.
+The split between "applies to everything" and "applies only to the v8jsi
+shared library" is deliberate — the V8 monolith static archive is
+**never** rebuilt through these knobs, so embedders pay only one V8
+rebuild cost per V8 roll.
+
+**Global GN args (`scripts/build_lib/build.py`)**
+
+| Arg | Why |
+|-----|-----|
+| `is_official_build=true` | Chromium's "ship" optimization bundle: tighter inlining, drop DCHECKs, strip extra reflection. |
+| `chrome_pgo_phase=0` | `is_official_build` implicitly enables PGO via a `tools/update_pgo_profiles.py` exec_script; V8 doesn't ship that script. |
+| `use_thin_lto=false` + `thin_lto_enable_optimizations=false` | Override the implicit LTO that `is_official_build` would flip on — see "Per-target LTO" below for why. |
+| `is_cfi=false` | `is_official_build` also turns on Control Flow Integrity on Linux/Android; CFI requires `use_thin_lto`, so they must move together. |
+| `symbol_level=0` | Drop DWARF entirely. Saves ~10-15 MB on Linux/macOS vs the default `-g2`. |
+| `v8_enable_disassembler=false` | `--print-code` / `--print-opt-code` disabled. Production embedders don't use them. |
+| `v8_enable_object_print=false` | `Object::Print()` removed. |
+| `v8_enable_gdbjit=false` | gdb JIT-interface descriptor table removed. |
+| `v8_enable_v8_checks=false` | V8-internal CHECK macros expanded to no-ops in release. |
+| `v8_enable_runtime_call_stats=false` | `--runtime-call-stats` CSV exporter removed. |
+| `v8_enable_heap_snapshot_verify=false` | Heap-snapshot self-verification removed. |
+| `v8jsi_enable_node_api=false` | **Functional**: drops the Node-API binding layer entirely. Embedders that consume v8jsi through N-API need a custom build with `v8jsi_enable_node_api=true`. |
+
+**v8jsi shared-library-only cflags (`src/BUILD.gn`, Release)**
+
+| Flag | Platform | Why |
+|------|----------|-----|
+| `-Os` / `/Os` | all | Favor small code in our ~20 TUs. V8 monolith stays on `-O2` since JS-execution perf matters more there. |
+| `-flto=thin` (cflags + ldflags) | all (clang-cl only on Win) | **Per-target LTO**: our TUs become bitcode, lld LTO-codegens across them at shared-library link time, V8 monolith static archive is consumed as opaque .o — exactly the split the user asked for. Global `use_thin_lto` stays off so the V8 build doesn't pay the LTO cost. |
+| `-fno-unique-section-names` | non-Win | Smaller section-name string table. |
+| `-fno-plt` | Linux/Android | Skip the PLT/GOT indirection for extern calls. |
+
+**v8jsi shared-library-only ldflags (`src/BUILD.gn`, all configs unless noted)**
+
+| Flag | Platform | Why |
+|------|----------|-----|
+| `-Wl,--icf=all` | Linux/Android | Identical Code Folding. V8 builtins template-instantiate heavily; many fold cleanly. macOS gets this via V8 defaults. |
+| `-Wl,--exclude-libs,ALL` | Linux/Android | Hide everything brought in from static archives so only `--version-script`-listed symbols hit `.dynsym`. |
+| `-Wl,--hash-style=gnu` | Linux/Android | Smaller `.gnu.hash` vs SysV `.hash`. |
+| `-Wl,-no_function_starts` | macOS/iOS | Drop `LC_FUNCTION_STARTS` load command (only `atos`/`leaks`/`dtrace` use it). |
+| `-Wl,-no_data_in_code_info` | macOS/iOS | Drop `LC_DATA_IN_CODE` load command (empty on modern Mach-O). |
+
+**Post-link strip (`_strip_packaged_binary` in `build.py`, Release only)**
+
+After copying the binary into the packaged `lib_dir`, the script runs
+`strip` on it. Dynamic exports (`.dynsym` on ELF, the Mach-O dynamic
+symtab) are preserved so embedders can still link/load.
+
+- Linux / Android: `strip --strip-all`
+- macOS / iOS: `strip -S -x` (debug + local symbols)
+- Windows: skipped — PDB is already separate, `/OPT:REF /OPT:ICF` handle the rest.
+
+**Why no global LTO?**
+
+The V8 build produces `libv8_monolith.a`, a ~1000-TU static archive. If
+we set `use_thin_lto=true`, the V8 build pipeline re-compiles every TU
+into bitcode (3-5x build-time cost) and lld then has to LTO-codegen the
+whole thing on every shared-library link. There's also a steady stream
+of `"object file is not bitcode"` warnings because some V8 archive
+members (Rust ffi, prebuilt third-party blobs) intentionally stay
+native. The pragmatic compromise: turn LTO on only at the v8jsi
+shared-library boundary — our ~20 TUs participate, the V8 monolith
+stays as it was.
+
 ---
 
 ## 4. Test Results

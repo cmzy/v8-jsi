@@ -108,6 +108,21 @@ target("shared_library", "v8jsi") {
   } else if (!is_mac && !is_ios) {
     ldflags = [ "-Wl,--allow-multiple-definition" ]
     ldflags += [ "-Wl,--version-script=" + rebase_path("//jsi/makev8jsi.lst") ]
+    # Identical Code Folding: fold byte-identical functions to one copy.
+    # V8 14 builtins produce many template instantiations that fold cleanly;
+    # macOS already gets this from the V8 build defaults, Linux/Android do
+    # not, so we wire it in explicitly here. lld supports --icf=all on
+    # these targets; if the build moves back to gold/bfd the flag has to
+    # change to --icf=safe (the only mode those linkers implement).
+    ldflags += [ "-Wl,--icf=all" ]
+    # Linux/Android size knobs: hide everything brought in from static
+    # archives (V8 monolith, libcxx, libcxxabi) so only the symbols our
+    # version script lists end up in `.dynsym`; switch to GNU hash, which
+    # produces a smaller `.gnu.hash` than SysV `.hash`.
+    ldflags += [
+      "-Wl,--exclude-libs,ALL",
+      "-Wl,--hash-style=gnu",
+    ]
   } else {
     # On macOS/iOS jsitests has its own copy of jsi.cpp (JSIException
     # lives there). With the default two-level namespace each side owns
@@ -118,6 +133,15 @@ target("shared_library", "v8jsi") {
     # coalesces the typeinfo symbols by name — same effect as the
     # Linux flat namespace + --version-script combination.
     ldflags = [ "-Wl,-flat_namespace" ]
+    # macOS/iOS size knobs: drop the LC_FUNCTION_STARTS and
+    # LC_DATA_IN_CODE load commands. The former is consumed only by the
+    # `atos`/`leaks`/`dtrace` tooling chain on a developer machine; the
+    # latter is empty on modern Mach-O builds. Together they shave
+    # ~MB-scale fat off the binary.
+    ldflags += [
+      "-Wl,-no_function_starts",
+      "-Wl,-no_data_in_code_info",
+    ]
   }
 
   include_dirs = [
@@ -139,6 +163,41 @@ target("shared_library", "v8jsi") {
     ":hybrid_crt_swap",
   ]
   configs -= [ "//build/config/compiler:no_exceptions" ]
+
+  # Production-only optimizations on the v8jsi shared library:
+  #   * `-Os` / `/Os`  — favor small code in our ~20 TUs (V8 monolith
+  #     stays on its default `-O2` for JS-execution speed)
+  #   * `-flto=thin`   — emit bitcode for our TUs and tell lld to LTO
+  #     across them at shared-library link time. The V8 monolith static
+  #     archive is *not* LTO'd (global `use_thin_lto` is forced off in
+  #     scripts/build_lib/build.py), so lld treats those object files
+  #     as opaque archive members — exactly the split we want: LTO on
+  #     the shared library, no LTO on the static lib.
+  #   * `-fno-unique-section-names` — let the linker merge per-function
+  #     sections by base name; cheaper string table than the per-TU
+  #     `.text._ZN...` uniqueness V8 emits by default. ELF/Mach-O only.
+  #   * `-fno-plt` (Linux/Android) — emit direct PC-relative calls to
+  #     extern symbols instead of routing through `.plt`/`.got.plt`.
+  #     Shrinks the PLT/GOT and removes a bunch of dynamic relocations.
+  if (!is_debug) {
+    if (is_win) {
+      cflags = [ "/Os" ]
+      if (is_clang) {
+        cflags += [ "-flto=thin" ]
+        ldflags += [ "-flto=thin" ]
+      }
+    } else {
+      cflags = [
+        "-Os",
+        "-flto=thin",
+        "-fno-unique-section-names",
+      ]
+      if (!is_mac && !is_ios) {
+        cflags += [ "-fno-plt" ]
+      }
+      ldflags += [ "-flto=thin" ]
+    }
+  }
 
   if (is_win) {
     configs -= [ "//build/config/compiler:cet_shadow_stack" ]

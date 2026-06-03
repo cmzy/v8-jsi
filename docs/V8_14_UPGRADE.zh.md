@@ -274,6 +274,121 @@ flag 不会传到 v8jsi target。如果需要给 v8jsi 单独加 cflag，在 `sr
   - Linux 的 sync 在第二次 fetch（追加另一个 `target_os`）时需要 reset
     dirty sub-repos，见上。
 
+### Inspector 变体
+
+每次 `build` / `all` 默认会**同时**产出带 inspector 和不带 inspector 两份
+二进制（`--inspector both`；传 `with` / `without` 跳过其中一个）。
+
+- 中间对象目录按 variant 隔开：
+  `build/v8/out/<app>/<cpu>/<cfg>/{with-inspector,noinspector}/`。
+- 打包后的二进制**并排**放在同一个 `lib_dir`（`out/lib/<app>/<cfg>/<cpu>/`），默认命名是带 inspector 的（向后兼容），不带 inspector 的加 `-noinspector` 后缀。
+
+各平台打包布局：
+
+| 平台 | 带 inspector | 不带 inspector | 备注 |
+|------|--------------|----------------|------|
+| win32 | `v8jsi.dll`（+ `.dll.lib`、`.dll.pdb`） | `v8jsi-noinspector.dll`（+ `.dll.lib`、`.dll.pdb`） | 三个文件都加后缀。|
+| mac | `libv8jsi.dylib` | `libv8jsi-noinspector.dylib` | |
+| linux | `libv8jsi.so` | `libv8jsi-noinspector.so` | |
+| android | `libv8jsi.so`（+ JNI-ABI 别名路径） | `libv8jsi-noinspector.so`（+ JNI-ABI 别名路径） | 见下方"Android JNI 镜像"。|
+| ios | `libv8jsi.framework/` | `libv8jsi-noinspector.framework/` | bundle 目录 + 内部二进制 + `Info.plist::CFBundleExecutable` 一起改名。|
+
+每个 variant 对应的 `args.gn` 也存进 `lib_dir`：
+`args.gn`（带 inspector）和 `args-noinspector.gn`。
+
+Inspector 代码目前只在 Windows 上真的接通了 —— `src/inspector/` 下的源
+文件在 BUILD.gn 里被 `is_win` 包着，调用点都被 `_WIN32 && V8JSI_ENABLE_INSPECTOR`
+双重 gate。非 Windows 平台上两个 variant 因此产出**完全相同**的二进制；
+我们仍然出两份，是为了让打包流水线和 embedder 侧的命名约定全平台一致，
+将来 inspector 移植到 POSIX 后能无缝接上。
+
+### Android JNI 镜像
+
+我们的 GN `target_cpu` 命名（`x64`、`x86`、`arm64`）跟 Android NDK ABI
+（Gradle `jniLibs.srcDirs` 期待的 `x86_64`、`x86`、`arm64-v8a`）不一致。
+`app_platform == "android"` 时打包步骤会把 `.so` **同时**写到两套布局：
+
+- `out/lib/android/<cfg>/<gn-cpu>/libv8jsi.so` —— 旧的 GN 风格路径。
+- `out/lib/android/<cfg>/<jni-abi>/libv8jsi.so` —— 直接 drop 给
+  `jniLibs.srcDirs '...lib/android/<cfg>'` 用，AAR 流水线不再需要中间
+  rename 脚本。
+
+映射表写在 `scripts/build_lib/build.py` 的 `_ANDROID_CPU_TO_ABI`；后续若
+要加 32 位 Android target，在那里补 `"arm" -> "armeabi-v7a"` 一条即可。
+
+### iOS framework 打包
+
+iOS 跟其他平台不同 —— GN 产物是一个目录 bundle（`libv8jsi.framework/`），
+不是单文件。打包步骤：
+
+1. 把 bundle 拷到 `lib_dir/libv8jsi<suffix>.framework/`。
+2. 改名 bundle 内部的二进制，让它跟 bundle 名一致（Xcode 拒绝加载
+   binary 名和 bundle 名对不上的 framework）。
+3. 修正 `Info.plist::CFBundleExecutable` 改成新名字。
+
+framework 内部的 symlink 会保留。
+
+### Release 专属的体积优化
+
+叠加在 V8 14 默认之上，**只在 `is_debug=false` 时生效**。"全局"和"只
+应用到 v8jsi 共享库"的拆分是刻意的 —— V8 monolith 静态库**永远**不
+会因为这些 knob 重编，embedder 每次 V8 升级只付一次 V8 编译代价。
+
+**全局 GN args（`scripts/build_lib/build.py`）**
+
+| 选项 | 为什么 |
+|------|--------|
+| `is_official_build=true` | Chromium 的 ship 优化套餐：更紧的 inlining、丢掉 DCHECK、去多余 reflection。|
+| `chrome_pgo_phase=0` | `is_official_build` 会隐式开 PGO，调 `tools/update_pgo_profiles.py` —— V8 不带这个脚本，关掉避免 gn gen 挂掉。|
+| `use_thin_lto=false` + `thin_lto_enable_optimizations=false` | 覆盖 `is_official_build` 隐式开的全局 LTO —— 见下面"Per-target LTO"那条解释为什么。|
+| `is_cfi=false` | Linux/Android 上 `is_official_build` 会顺带开 CFI；CFI 又强制要 LTO，所以必须一起关。|
+| `symbol_level=0` | 彻底丢 DWARF。比 V8 默认 `-g2` 在 Linux/macOS 各省 10-15 MB。|
+| `v8_enable_disassembler=false` | 关 `--print-code` / `--print-opt-code`。生产 embedder 用不到。|
+| `v8_enable_object_print=false` | 去掉 `Object::Print()`。|
+| `v8_enable_gdbjit=false` | 去掉 gdb JIT 接口表。|
+| `v8_enable_v8_checks=false` | V8 内部 CHECK 宏在 release 下变 no-op。|
+| `v8_enable_runtime_call_stats=false` | 去掉 `--runtime-call-stats` 输出器。|
+| `v8_enable_heap_snapshot_verify=false` | 去掉堆快照自检。|
+| `v8jsi_enable_node_api=false` | **功能性**：完全不编 Node-API 绑定层。要 N-API 的 embedder 必须自己重编打开 `v8jsi_enable_node_api=true`。|
+
+**v8jsi 共享库专属 cflag（`src/BUILD.gn`，仅 Release）**
+
+| 选项 | 平台 | 为什么 |
+|------|------|--------|
+| `-Os` / `/Os` | 全 | 我们这 ~20 个 TU 走小代码优先。V8 monolith 保持 `-O2`（JS 跑分优先）。|
+| `-flto=thin`（cflags + ldflags） | 全（Windows 仅 clang-cl） | **Per-target LTO**：我们的 TU 编成 bitcode，lld 链接 shared library 时跨这些 TU LTO codegen；V8 monolith 静态归档作为不透明 .o 被吞 —— 正是你要的"so 包开 LTO、静态库不开 LTO"。全局 `use_thin_lto` 保持 off，V8 不用重编。|
+| `-fno-unique-section-names` | 非 Win | 缩小 section-name 字符串表。|
+| `-fno-plt` | Linux/Android | extern 调用跳过 PLT/GOT 间接。|
+
+**v8jsi 共享库专属 ldflag（`src/BUILD.gn`，除非另注）**
+
+| 选项 | 平台 | 为什么 |
+|------|------|--------|
+| `-Wl,--icf=all` | Linux/Android | Identical Code Folding。V8 builtins 模板实例化多，能折叠不少。macOS 走 V8 默认。|
+| `-Wl,--exclude-libs,ALL` | Linux/Android | 静态归档里的符号全 hide，只有 `--version-script` 列的进 `.dynsym`。|
+| `-Wl,--hash-style=gnu` | Linux/Android | `.gnu.hash` 比 SysV `.hash` 紧凑。|
+| `-Wl,-no_function_starts` | macOS/iOS | 干掉 `LC_FUNCTION_STARTS` load command（只有 `atos`/`leaks`/`dtrace` 用）。|
+| `-Wl,-no_data_in_code_info` | macOS/iOS | 干掉 `LC_DATA_IN_CODE`（现代 Mach-O 是空的）。|
+
+**Post-link strip（`build.py::_strip_packaged_binary`，仅 Release）**
+
+把二进制拷到 `lib_dir` 后跑 `strip`。动态导出表（ELF 的 `.dynsym`、
+Mach-O 的 dynamic symtab）保留，embedder 还能正常 link/load。
+
+- Linux / Android：`strip --strip-all`
+- macOS / iOS：`strip -S -x`（debug + local 符号）
+- Windows：跳过 —— PDB 已分离，`/OPT:REF /OPT:ICF` 干剩下的。
+
+**为什么不开全局 LTO？**
+
+V8 build 出的是 `libv8_monolith.a`，一个 ~1000 TU 的静态库。如果设
+`use_thin_lto=true`，V8 的整个 build pipeline 都要重编成 bitcode（3-5
+倍编译时间），lld 每次链 shared library 都得 LTO codegen 整个 archive。
+还有一堆 `"object file is not bitcode"` warning，因为 V8 archive 里
+有些成员（Rust ffi、预编 third_party 二进制）就是 native 的。务实折
+中：LTO 只在 v8jsi shared library 这层开 —— 我们的 ~20 个 TU 参与，
+V8 monolith 原样吞。
+
 ---
 
 ## 4. 测试结果
