@@ -302,18 +302,53 @@ Inspector 代码目前只在 Windows 上真的接通了 —— `src/inspector/` 
 我们仍然出两份，是为了让打包流水线和 embedder 侧的命名约定全平台一致，
 将来 inspector 移植到 POSIX 后能无缝接上。
 
-### Android JNI 镜像
+### Android Prefab AAR 打包
 
-我们的 GN `target_cpu` 命名（`x64`、`x86`、`arm64`）跟 Android NDK ABI
-（Gradle `jniLibs.srcDirs` 期待的 `x86_64`、`x86`、`arm64-v8a`）不一致。
-`app_platform == "android"` 时打包步骤会把 `.so` **同时**写到两套布局：
+Android 唯一的产物是 [Prefab](https://google.github.io/prefab/) AAR，
+每个 inspector variant 一个文件。AGP 7+ 打开
+`buildFeatures { prefab true }` 后通过 CMake
+`find_package(v8jsi REQUIRED CONFIG)` /
+`target_link_libraries(myapp v8jsi::v8jsi)` 直接消费 —— embedder
+不用手动把 .so 放进 `jniLibs/`。
 
-- `out/lib/android/<cfg>/<gn-cpu>/libv8jsi.so` —— 旧的 GN 风格路径。
-- `out/lib/android/<cfg>/<jni-abi>/libv8jsi.so` —— 直接 drop 给
-  `jniLibs.srcDirs '...lib/android/<cfg>'` 用，AAR 流水线不再需要中间
-  rename 脚本。
+```
+out/lib/android/<cfg>/
+  v8jsi.aar                 # 带 inspector
+  v8jsi-noinspector.aar     # 不带 inspector（如果编了）
+```
 
-映射表写在 `scripts/build_lib/build.py` 的 `_ANDROID_CPU_TO_ABI`：
+AAR 内部结构：
+
+```
+AndroidManifest.xml          (package com.microsoft.v8jsi[.noinspector])
+prefab/
+  prefab.json                (schema_version 2, name=v8jsi, version=1.0.0)
+  modules/v8jsi/
+    module.json              (library_name=libv8jsi, 无 exports)
+    libs/
+      android.arm64-v8a/
+        abi.json             (api=21, ndk=26, stl=none)
+        libv8jsi.so          (stripped 后的)
+      android.x86_64/
+        ...                  (其它 ABI 编出来后追加进同一个 AAR)
+```
+
+单 CPU 构建**累加**进同一个 AAR。先后跑：
+
+```
+dev.py build --app-platform android --platform arm64 ...
+dev.py build --app-platform android --platform x86_64 ...
+```
+
+得到的 `v8jsi.aar` 里同时有 `arm64-v8a` 和 `x86_64` 的 lib。
+`scripts/build_lib/build.py` 的 `_update_prefab_aar` 读取已有 AAR，
+保留所有不是当前 ABI 目录、也不是 meta 文件的 entry，然后重写整个 bundle。
+
+`stl = "none"` 是因为 V8 monolith 已经把 libcxx 静态链进 libv8jsi —— consumer
+不需要单独的 C++ runtime 绑定。
+
+GN `target_cpu` → NDK ABI 映射（`scripts/build_lib/build.py` 的
+`_ANDROID_CPU_TO_ABI`）：
 
 | GN `target_cpu` | NDK ABI |
 |-----------------|---------|
@@ -321,9 +356,6 @@ Inspector 代码目前只在 Windows 上真的接通了 —— `src/inspector/` 
 | `x86` | `x86` |
 | `arm64` | `arm64-v8a` |
 | `arm` | `armeabi-v7a` |
-
-每个变体都要单独构建 —— `dev.py build --app-platform android --platform <cpu>`
-对每个要发布的 ABI 跑一次。
 
 ### iOS framework 打包
 

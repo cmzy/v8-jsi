@@ -5,8 +5,11 @@ Mirrors ``scripts/build.ps1``.
 
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
+import tempfile
+import zipfile
 from pathlib import Path
 
 from . import env
@@ -220,6 +223,136 @@ _ANDROID_CPU_TO_ABI = {
     "arm64": "arm64-v8a",
     "arm": "armeabi-v7a",
 }
+
+
+# Prefab packaging metadata. See https://google.github.io/prefab/ for the
+# schema; AGP 7+ consumes Prefab v2 AARs via `buildFeatures { prefab true }`.
+_PREFAB_SCHEMA_VERSION = 2
+_PREFAB_MIN_API = 21
+_PREFAB_NDK_VERSION = 26
+_PREFAB_MODULE_NAME = "v8jsi"
+
+_ANDROID_AAR_MANIFEST_TEMPLATE = """<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.microsoft.v8jsi{id_suffix}">
+    <uses-sdk android:minSdkVersion="21" />
+</manifest>
+"""
+
+
+def _prefab_aar_manifest_bytes(suffix: str) -> bytes:
+    """Minimal AndroidManifest.xml for the AAR. The package id is
+    suffixed so a `v8jsi.aar` and a `v8jsi-noinspector.aar` can be
+    referenced in the same gradle build without colliding."""
+    id_suffix = "." + suffix.lstrip("-") if suffix else ""
+    return _ANDROID_AAR_MANIFEST_TEMPLATE.format(
+        id_suffix=id_suffix
+    ).encode("utf-8")
+
+
+def _prefab_root_json_bytes() -> bytes:
+    return (
+        json.dumps(
+            {
+                "schema_version": _PREFAB_SCHEMA_VERSION,
+                "name": _PREFAB_MODULE_NAME,
+                "version": "1.0.0",
+                "dependencies": [],
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _prefab_module_json_bytes() -> bytes:
+    return (
+        json.dumps(
+            {
+                "export_libraries": [],
+                "library_name": "libv8jsi",
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _prefab_abi_json_bytes(abi: str) -> bytes:
+    # `stl: "none"` because V8 monolith already links libcxx statically
+    # into libv8jsi — the consumer doesn't need a C++ runtime hookup.
+    return (
+        json.dumps(
+            {
+                "abi": abi,
+                "api": _PREFAB_MIN_API,
+                "ndk": _PREFAB_NDK_VERSION,
+                "stl": "none",
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _update_prefab_aar(
+    aar_path: Path,
+    abi: str,
+    so_path: Path,
+    suffix: str,
+) -> None:
+    """Add (or replace) the current ABI's stripped libv8jsi.so inside a
+    Prefab-format AAR at ``aar_path``.
+
+    Single-ABI builds accumulate: if the AAR already contains entries
+    for other ABIs they are preserved verbatim, so running
+    ``dev.py build --app-platform android --platform arm64`` and then
+    ``--platform x86_64`` produces one fat AAR with both ``arm64-v8a``
+    and ``x86_64`` libs.
+
+    The Prefab *module* name is fixed (`v8jsi`); the ``{suffix}`` only
+    distinguishes the AAR filename (``v8jsi.aar`` vs
+    ``v8jsi-noinspector.aar``) and the AndroidManifest package id, so
+    consumers don't have to rename ``find_package(v8jsi REQUIRED)`` when
+    they swap variants.
+    """
+    abi_dir = f"prefab/modules/{_PREFAB_MODULE_NAME}/libs/android.{abi}"
+    abi_so_entry = f"{abi_dir}/libv8jsi.so"
+    abi_meta_entry = f"{abi_dir}/abi.json"
+    manifest_entry = "AndroidManifest.xml"
+    root_meta_entry = "prefab/prefab.json"
+    module_meta_entry = (
+        f"prefab/modules/{_PREFAB_MODULE_NAME}/module.json"
+    )
+
+    # Entries we always regenerate (manifest + prefab descriptors + this
+    # ABI's files). Everything else from a previous AAR — i.e. other
+    # ABIs' lib directories — is carried over unchanged.
+    regenerated = {
+        manifest_entry,
+        root_meta_entry,
+        module_meta_entry,
+        abi_so_entry,
+        abi_meta_entry,
+    }
+
+    preserved: dict[str, bytes] = {}
+    if aar_path.exists():
+        with zipfile.ZipFile(aar_path, "r") as zf:
+            for info in zf.infolist():
+                if info.filename in regenerated:
+                    continue
+                preserved[info.filename] = zf.read(info.filename)
+
+    aar_path.parent.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(aar_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr(manifest_entry, _prefab_aar_manifest_bytes(suffix))
+        zf.writestr(root_meta_entry, _prefab_root_json_bytes())
+        zf.writestr(module_meta_entry, _prefab_module_json_bytes())
+        zf.writestr(abi_meta_entry, _prefab_abi_json_bytes(abi))
+        zf.write(so_path, abi_so_entry)
+        for name, data in sorted(preserved.items()):
+            zf.writestr(name, data)
 
 
 def _strip_packaged_binary(binary: Path, app_platform: str) -> None:
@@ -556,9 +689,17 @@ def _package(
     inc_node_api_jsi_loaders = inc_node_api_jsi / "ApiLoaders"
     inc_jsi = include_root.parent / "jsi" / "jsi"
     license_dir = output_path / "license"
-    lib_dir = (
-        output_path / "lib" / app_platform / configuration / platform_cpu
-    )
+    if app_platform == "android":
+        # Android ships as a single Prefab AAR per inspector variant —
+        # there is no bare .so or per-CPU subdirectory. Successive
+        # single-ABI builds drop their AAR side-by-side at
+        # `out/lib/android/<cfg>/`, and `_update_prefab_aar` accumulates
+        # ABIs into the same AAR on re-runs.
+        lib_dir = output_path / "lib" / app_platform / configuration
+    else:
+        lib_dir = (
+            output_path / "lib" / app_platform / configuration / platform_cpu
+        )
     _mkdirs(
         inc_node_api,
         inc_node_api_jsi,
@@ -606,19 +747,26 @@ def _package(
         _copy(out_dir / "libv8jsi.so", dst)
         stripped_targets.append(dst)
     elif app_platform == "android":
-        dst = lib_dir / f"libv8jsi{suffix}.so"
-        _copy(out_dir / "libv8jsi.so", dst)
-        stripped_targets.append(dst)
-        # Mirror the .so under the NDK ABI name as well so embedders can
-        # point Gradle's `jniLibs.srcDirs` at `out/lib/android/<cfg>/`
-        # directly. The legacy `<cpu>` path above is preserved.
+        # Android ships as a Prefab AAR. Strip happens inline on a
+        # staged copy in a temp directory before bundling; this avoids
+        # both leaving a stray stripped .so under lib_dir and a second
+        # strip pass on the same file inside the post-strip loop below.
         abi = _ANDROID_CPU_TO_ABI.get(platform_cpu)
-        if abi:
-            jni_dir = output_path / "lib" / "android" / configuration / abi
-            jni_dir.mkdir(parents=True, exist_ok=True)
-            jni_dst = jni_dir / f"libv8jsi{suffix}.so"
-            _copy(out_dir / "libv8jsi.so", jni_dst)
-            stripped_targets.append(jni_dst)
+        src_so = out_dir / "libv8jsi.so"
+        if abi is None:
+            print(
+                f"warning: no Android NDK ABI mapping for target_cpu="
+                f"{platform_cpu}; skipping AAR packaging",
+                flush=True,
+            )
+        elif src_so.exists():
+            with tempfile.TemporaryDirectory(prefix="v8jsi-android-") as td:
+                staged_so = Path(td) / "libv8jsi.so"
+                shutil.copy2(src_so, staged_so)
+                if is_release:
+                    _strip_packaged_binary(staged_so, app_platform)
+                aar_path = lib_dir / f"v8jsi{suffix}.aar"
+                _update_prefab_aar(aar_path, abi, staged_so, suffix)
     elif app_platform == "ios":
         # Same framework treatment as macOS — see `_wrap_dylib_as_apple_framework`.
         src_dy = out_dir / "libv8jsi.dylib"
@@ -633,8 +781,11 @@ def _package(
         for binary in stripped_targets:
             _strip_packaged_binary(binary, app_platform)
 
-    args_name = "args.gn" if enable_inspector else "args-noinspector.gn"
-    _copy(out_dir / "args.gn", lib_dir / args_name)
+    if app_platform != "android":
+        # Android's AAR is self-contained — multiple ABIs would each
+        # produce a different args.gn anyway, so we don't ship one.
+        args_name = "args.gn" if enable_inspector else "args-noinspector.gn"
+        _copy(out_dir / "args.gn", lib_dir / args_name)
 
     # --- headers ---
     jsi_src = sources_path / "src"

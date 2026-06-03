@@ -332,20 +332,53 @@ both so the packaging pipeline and embedder-side naming convention stay
 uniform across platforms, and so a future POSIX inspector port slots in
 without rearranging the output tree.
 
-### Android JNI mirroring
+### Android Prefab AAR packaging
 
-Our GN `target_cpu` names (`x64`, `x86`, `arm64`) don't match the Android
-NDK ABI names that Gradle's `jniLibs.srcDirs` expects (`x86_64`, `x86`,
-`arm64-v8a`). When `app_platform == "android"`, the packager writes the
-`.so` to **both** layouts:
+The only Android deliverable is a [Prefab](https://google.github.io/prefab/)
+AAR per inspector variant. AGP 7+ (`buildFeatures { prefab true }`)
+consumes it via CMake `find_package(v8jsi REQUIRED CONFIG)` /
+`target_link_libraries(myapp v8jsi::v8jsi)` — embedders never need to
+hand-place .so files into `jniLibs/`.
 
-- `out/lib/android/<cfg>/<gn-cpu>/libv8jsi.so` — legacy / GN-style path.
-- `out/lib/android/<cfg>/<jni-abi>/libv8jsi.so` — drop-in for
-  `jniLibs.srcDirs '...lib/android/<cfg>'` so the .aar pipeline doesn't
-  need a rename step.
+```
+out/lib/android/<cfg>/
+  v8jsi.aar                 # with-inspector
+  v8jsi-noinspector.aar     # noinspector (if built)
+```
 
-The mapping table lives in `scripts/build_lib/build.py` as
-`_ANDROID_CPU_TO_ABI`:
+AAR contents:
+
+```
+AndroidManifest.xml          (package com.microsoft.v8jsi[.noinspector])
+prefab/
+  prefab.json                (schema_version 2, name=v8jsi, version=1.0.0)
+  modules/v8jsi/
+    module.json              (library_name=libv8jsi, no exports)
+    libs/
+      android.arm64-v8a/
+        abi.json             (api=21, ndk=26, stl=none)
+        libv8jsi.so          (stripped)
+      android.x86_64/
+        ...                  (other ABIs accumulate as you build them)
+```
+
+Single-CPU builds **accumulate** into the same AAR. Running
+
+```
+dev.py build --app-platform android --platform arm64 ...
+dev.py build --app-platform android --platform x86_64 ...
+```
+
+leaves one `v8jsi.aar` containing both `arm64-v8a` and `x86_64` libs.
+`_update_prefab_aar` in `scripts/build_lib/build.py` reads the existing
+AAR, preserves every entry that isn't the current ABI's directory or one
+of the regenerated meta files, then rewrites the bundle.
+
+`stl = "none"` because the V8 monolith already links libcxx statically
+into libv8jsi; consumers don't need a separate C++ runtime hookup.
+
+The GN `target_cpu` → NDK ABI mapping
+(`_ANDROID_CPU_TO_ABI` in `scripts/build_lib/build.py`):
 
 | GN `target_cpu` | NDK ABI |
 |-----------------|---------|
@@ -353,9 +386,6 @@ The mapping table lives in `scripts/build_lib/build.py` as
 | `x86` | `x86` |
 | `arm64` | `arm64-v8a` |
 | `arm` | `armeabi-v7a` |
-
-Each variant has to be built explicitly — `dev.py build --app-platform
-android --platform <cpu>` once per ABI you want to ship.
 
 ### iOS framework packaging
 
