@@ -6,6 +6,14 @@ declare_args() {
   v8jsi_enable_node_api = true
 }
 
+# On macOS / iOS the GN target stays `shared_library` (producing a bare
+# `libv8jsi.dylib`); the Python packager (`scripts/build_lib/build.py`)
+# wraps it into a `libv8jsi.framework/` bundle that Xcode embedders
+# accept. This avoids the more invasive switch to
+# `mac_framework_bundle` / `ios_framework_bundle` templates (which add
+# bundle_data/info_plist/framework_version plumbing throughout) while
+# producing functionally equivalent output for the consumer.
+
 # Hybrid CRT: drop the static UCRT pulled in by /MT(d) and use the dynamic
 # system UCRT instead. Result: no MSVCP140.dll / VCRUNTIME140.dll dependency,
 # and no Visual C++ Redistributable required on end-user machines.

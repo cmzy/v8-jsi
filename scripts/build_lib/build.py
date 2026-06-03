@@ -287,6 +287,115 @@ def _copy_ios_framework(
         info_plist.write_text(text, encoding="utf-8")
 
 
+_APPLE_FRAMEWORK_INFO_PLIST = """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>{binary_name}</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.microsoft.v8jsi{id_suffix}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>{binary_name}</string>
+    <key>CFBundlePackageType</key>
+    <string>FMWK</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+{platform_keys}
+</dict>
+</plist>
+"""
+
+_PLATFORM_PLIST_KEYS = {
+    "ios": (
+        "    <key>MinimumOSVersion</key>\n"
+        "    <string>12.0</string>\n"
+        "    <key>CFBundleSupportedPlatforms</key>\n"
+        "    <array>\n"
+        "        <string>iPhoneOS</string>\n"
+        "    </array>"
+    ),
+    "mac": (
+        "    <key>LSMinimumSystemVersion</key>\n"
+        "    <string>12.0</string>\n"
+        "    <key>CFBundleSupportedPlatforms</key>\n"
+        "    <array>\n"
+        "        <string>MacOSX</string>\n"
+        "    </array>"
+    ),
+}
+
+
+def _wrap_dylib_as_apple_framework(
+    src_dylib: Path,
+    dst_framework: Path,
+    *,
+    suffix: str,
+    app_platform: str,
+) -> Path:
+    """Wrap a bare libv8jsi dylib into a flat (unversioned) Apple
+    framework bundle on macOS or iOS.
+
+    GN's `shared_library` template emits a bare `libv8jsi.dylib`;
+    Xcode-style embedders expect a `libv8jsi.framework/` bundle with the
+    `@rpath/libv8jsi.framework/libv8jsi` install name and an
+    `Info.plist` declaring `CFBundleExecutable` / `CFBundlePackageType =
+    FMWK`. We assemble that bundle here:
+
+      libv8jsi.framework/
+        libv8jsi          # the dylib, install-name fixed
+        Info.plist        # minimal FMWK plist (platform-specific keys)
+
+    Unversioned (no `Versions/A/...` indirection) is acceptable for
+    embedded frameworks on both modern macOS and iOS; this keeps the
+    layout consistent between the two and avoids the symlink dance the
+    versioned-framework layout requires.
+
+    Returns the path to the framework's internal binary so the caller
+    can hand it off to the strip pass.
+    """
+    if dst_framework.exists():
+        shutil.rmtree(dst_framework)
+    dst_framework.mkdir(parents=True)
+    binary_name = f"libv8jsi{suffix}"
+    dst_binary = dst_framework / binary_name
+    shutil.copy2(src_dylib, dst_binary)
+    # Fix install name so apps that link against the framework resolve
+    # the binary through the bundle structure, not the bare dylib path.
+    try:
+        subprocess.run(
+            [
+                "install_name_tool",
+                "-id",
+                f"@rpath/libv8jsi{suffix}.framework/{binary_name}",
+                str(dst_binary),
+            ],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(
+            f"warning: install_name_tool failed on {dst_binary} ({exc}); "
+            f"the framework will still load but @rpath lookups may need "
+            f"manual fixup",
+            flush=True,
+        )
+    (dst_framework / "Info.plist").write_text(
+        _APPLE_FRAMEWORK_INFO_PLIST.format(
+            binary_name=binary_name,
+            id_suffix=suffix.replace("-", "."),
+            platform_keys=_PLATFORM_PLIST_KEYS[app_platform],
+        ),
+        encoding="utf-8",
+    )
+    return dst_binary
+
+
 def build(
     sources_path: Path,
     *,
@@ -482,9 +591,16 @@ def _package(
             )
         # Windows: PDB is already separate, no post-link strip needed.
     elif app_platform == "mac":
-        dst = lib_dir / f"libv8jsi{suffix}.dylib"
-        _copy(out_dir / "libv8jsi.dylib", dst)
-        stripped_targets.append(dst)
+        # Embed the dylib in a `libv8jsi.framework/` bundle so consumers
+        # can drop it into an Xcode project's Frameworks group without
+        # extra bundling steps.
+        src_dy = out_dir / "libv8jsi.dylib"
+        dst_fw = lib_dir / f"libv8jsi{suffix}.framework"
+        if src_dy.exists():
+            bin_inside = _wrap_dylib_as_apple_framework(
+                src_dy, dst_fw, suffix=suffix, app_platform="mac"
+            )
+            stripped_targets.append(bin_inside)
     elif app_platform == "linux":
         dst = lib_dir / f"libv8jsi{suffix}.so"
         _copy(out_dir / "libv8jsi.so", dst)
@@ -504,13 +620,14 @@ def _package(
             _copy(out_dir / "libv8jsi.so", jni_dst)
             stripped_targets.append(jni_dst)
     elif app_platform == "ios":
-        src_fw = out_dir / "libv8jsi.framework"
-        if src_fw.exists():
-            dst_fw = lib_dir / f"libv8jsi{suffix}.framework"
-            _copy_ios_framework(src_fw, dst_fw, suffix=suffix)
-            # The internal binary inside the framework bundle is what
-            # gets loaded; strip that.
-            stripped_targets.append(dst_fw / f"libv8jsi{suffix}")
+        # Same framework treatment as macOS — see `_wrap_dylib_as_apple_framework`.
+        src_dy = out_dir / "libv8jsi.dylib"
+        dst_fw = lib_dir / f"libv8jsi{suffix}.framework"
+        if src_dy.exists():
+            bin_inside = _wrap_dylib_as_apple_framework(
+                src_dy, dst_fw, suffix=suffix, app_platform="ios"
+            )
+            stripped_targets.append(bin_inside)
 
     if is_release:
         for binary in stripped_targets:
